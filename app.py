@@ -39,6 +39,7 @@ import tempfile
 import shutil
 import base64
 import html
+import hashlib
 from collections import defaultdict
 
 import streamlit as st
@@ -4157,11 +4158,56 @@ def _display_dataframe_one_based(df, *, height=None, use_container_width=True, i
     st.dataframe(display_df, **kwargs)
 
 
+def _stable_download_key(*parts, prefix="download"):
+    """Create a stable Streamlit widget key for download buttons."""
+    raw = "|".join(str(p) for p in parts if p is not None)
+    digest = hashlib.md5(raw.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    safe_prefix = sanitize_filename(prefix, fallback="download")
+    return f"{safe_prefix}_{digest}"
+
+
+def _safe_download_button(label, data, file_name, mime, key=None, disabled=False):
+    """Render a Streamlit download button without unnecessary reruns.
+
+    On recent Streamlit versions, ``on_click="ignore"`` lets the browser
+    download the prepared bytes without rerunning the whole app. This is
+    important for generated ZIP/figure/table outputs because a normal rerun can
+    refresh widgets or clear temporary download state on Streamlit Cloud. Older
+    Streamlit versions do not support this argument, so we fall back safely.
+    """
+    if data is None:
+        data = b""
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    if key is None:
+        key = _stable_download_key(label, file_name, prefix="download_button")
+
+    kwargs = dict(
+        label=label,
+        data=data,
+        file_name=file_name,
+        mime=mime,
+        key=key,
+        disabled=disabled,
+    )
+    try:
+        return st.download_button(**kwargs, on_click="ignore")
+    except TypeError:
+        # Compatibility with older Streamlit releases.
+        return st.download_button(**kwargs)
+
+
 def _dataframe_download_button(df, filename, label):
     if df is None or df.empty:
         return
     csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button(label, data=csv, file_name=filename, mime="text/csv")
+    _safe_download_button(
+        label,
+        data=csv,
+        file_name=filename,
+        mime="text/csv",
+        key=_stable_download_key(filename, label, prefix="csv_download"),
+    )
 
 
 def _figure_download_bytes(fig, fmt="png"):
@@ -4208,7 +4254,7 @@ def _render_single_plot_download_button(fig, plot_name, settings, key_prefix="si
     safe_plot_name = sanitize_filename(plot_name, fallback="ChloroCodon_plot")
     file_ext = "tiff" if fmt == "tiff" else fmt
     plot_bytes = _figure_download_bytes(fig, fmt)
-    st.download_button(
+    _safe_download_button(
         f"Download {plot_name.replace('_', ' ')} ({fmt.upper()})",
         data=plot_bytes,
         file_name=f"{safe_plot_name}.{file_ext}",
@@ -4990,6 +5036,7 @@ def _clear_batch_result_state():
     for key in [
         "batch_result_log_df",
         "batch_result_zip_bytes",
+        "batch_result_zip_filename",
         "batch_comparative_rscu_df",
         "batch_comparative_optimal_df",
         "batch_result_signature",
@@ -5122,11 +5169,13 @@ def _render_single_mode(settings):
                 st.session_state["single_result_zip_bytes"] = _make_single_output_zip(data, result_uploaded_name, settings)
                 st.session_state["single_result_zip_signature"] = zip_signature
 
-        st.download_button(
+        single_zip_filename = f"{sanitize_filename(Path(result_uploaded_name).stem)}_ChloroCodon_results.zip"
+        _safe_download_button(
             "Download complete single-file output ZIP",
             data=st.session_state.get("single_result_zip_bytes", b""),
-            file_name=f"{sanitize_filename(Path(result_uploaded_name).stem)}_ChloroCodon_results.zip",
+            file_name=single_zip_filename,
             mime="application/zip",
+            key=_stable_download_key("single_zip", single_zip_filename, zip_signature, prefix="single_zip_download"),
         )
 
 
@@ -5306,6 +5355,7 @@ def _render_batch_mode(settings):
             log_df, zip_bytes, comparative_rscu_df, comparative_optimal_df = _run_batch_analysis_streamlit(uploaded_files, settings)
             st.session_state["batch_result_log_df"] = log_df
             st.session_state["batch_result_zip_bytes"] = zip_bytes
+            st.session_state["batch_result_zip_filename"] = f"ChloroCodon_Batch_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
             st.session_state["batch_comparative_rscu_df"] = comparative_rscu_df
             st.session_state["batch_comparative_optimal_df"] = comparative_optimal_df
             st.session_state["batch_result_signature"] = current_signature
@@ -5356,11 +5406,16 @@ def _render_batch_mode(settings):
             """,
             unsafe_allow_html=True,
         )
-        st.download_button(
+        batch_zip_filename = st.session_state.get(
+            "batch_result_zip_filename",
+            f"ChloroCodon_Batch_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+        )
+        _safe_download_button(
             "Download complete batch output ZIP",
             data=zip_bytes,
-            file_name=f"ChloroCodon_Batch_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+            file_name=batch_zip_filename,
             mime="application/zip",
+            key=_stable_download_key("batch_zip", batch_zip_filename, st.session_state.get("batch_result_signature"), prefix="batch_zip_download"),
         )
 
 
