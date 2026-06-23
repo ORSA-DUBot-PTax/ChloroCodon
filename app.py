@@ -1365,7 +1365,7 @@ RSCU_STACKED_CMAPS = [
 ]
 
 GENBANK_EXTENSIONS = {".gb", ".gbk", ".genbank"}
-BATCH_FILE_LIMIT = 100
+BATCH_FILE_LIMIT = 50
 
 # Scatter-plot visibility constants.
 # Strong marker outlines and high opacity prevent pale academic colormaps from
