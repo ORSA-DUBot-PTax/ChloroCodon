@@ -1867,9 +1867,11 @@ def create_composition_boxplot_figure(data, width, height, palette,
         fig.tight_layout()
         return fig
 
-    bplot = ax.boxplot(
-        values,
-        labels=COMPOSITION_BOXPLOT_PARAMETERS,
+    # Matplotlib 3.9+ renamed the boxplot label argument from
+    # ``labels`` to ``tick_labels``. Streamlit Cloud may install a newer
+    # Matplotlib than the local machine, so this compatibility wrapper keeps
+    # the app working in both environments.
+    boxplot_kwargs = dict(
         patch_artist=True,
         widths=0.58,
         showmeans=True,
@@ -1882,6 +1884,21 @@ def create_composition_boxplot_figure(data, width, height, palette,
         flierprops=dict(marker="o", markerfacecolor=palette.get("accent", "#d99a2b"),
                         markeredgecolor=palette.get("line", "#111111"), markersize=4.0, alpha=0.85),
     )
+    try:
+        bplot = ax.boxplot(
+            values,
+            tick_labels=COMPOSITION_BOXPLOT_PARAMETERS,
+            **boxplot_kwargs,
+        )
+    except TypeError as exc:
+        # Older Matplotlib versions do not have tick_labels yet.
+        if "tick_labels" not in str(exc):
+            raise
+        bplot = ax.boxplot(
+            values,
+            labels=COMPOSITION_BOXPLOT_PARAMETERS,
+            **boxplot_kwargs,
+        )
 
     if color_mode == "single_color":
         colors = [single_color] * len(COMPOSITION_BOXPLOT_PARAMETERS)
