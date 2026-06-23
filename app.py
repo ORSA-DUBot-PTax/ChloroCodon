@@ -49,6 +49,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap, BoundaryNorm
+from matplotlib.patches import Patch
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.stats import linregress
 from scipy.cluster.hierarchy import linkage, dendrogram
@@ -525,6 +527,42 @@ def third_position_stats(seq):
         "GC_bias": G/gc if gc else np.nan
     }
 
+def synonymous_third_position_stats_from_counts(codon_counts, table_id=11):
+    """Return per-gene synonymous third-position composition percentages.
+
+    A3s, T3s, C3s, G3s, and GC3s are calculated from synonymous
+    codon families only. Single-codon amino acids and stop codons are
+    excluded, matching the genome-level A3s/T3s/C3s/G3s/GC3s logic.
+    """
+    global AA_TO_CODONS, STOP_CODONS
+    if AA_TO_CODONS is None or not STOP_CODONS:
+        init_codon_maps(table_id)
+
+    syn3 = {"A": 0, "T": 0, "G": 0, "C": 0}
+    for aa, codons in AA_TO_CODONS.items():
+        if len(codons) <= 1:
+            continue
+        for codon in codons:
+            if codon in STOP_CODONS:
+                continue
+            syn3[codon[2]] += int(codon_counts.get(codon, 0))
+
+    syn3_total = sum(syn3.values())
+    if syn3_total == 0:
+        return {"A3s": np.nan, "T3s": np.nan, "C3s": np.nan, "G3s": np.nan, "GC3s": np.nan}
+
+    def pct(base):
+        return syn3[base] / syn3_total * 100.0
+
+    return {
+        "A3s": pct("A"),
+        "T3s": pct("T"),
+        "C3s": pct("C"),
+        "G3s": pct("G"),
+        "GC3s": (syn3["G"] + syn3["C"]) / syn3_total * 100.0,
+    }
+
+
 
 def compute_per_gene_metrics(rec, table_id=11):
     """Compute all metrics for one CDS."""
@@ -547,6 +585,7 @@ def compute_per_gene_metrics(rec, table_id=11):
     enc = effective_number_of_codons(codon_counts, table_id)
     enc_exp = expected_enc(gc3)
     third = third_position_stats(seq)
+    syn3 = synonymous_third_position_stats_from_counts(codon_counts, table_id=table_id)
     rscu, _ = rscu_from_counts(codon_counts_for_rscu, table_id)
     return {
         "label": rec["label"],
@@ -568,6 +607,11 @@ def compute_per_gene_metrics(rec, table_id=11):
         "T3": third["T3"],
         "G3": third["G3"],
         "C3": third["C3"],
+        "A3s": syn3["A3s"],
+        "T3s": syn3["T3s"],
+        "C3s": syn3["C3s"],
+        "G3s": syn3["G3s"],
+        "GC3s": syn3["GC3s"],
         "AT_bias": third["AT_bias"],
         "GC_bias": third["GC_bias"],
         "codon_counts": codon_counts,
@@ -661,16 +705,57 @@ def aggregate_genome_stats(metrics_list):
         "Avg_ENC": float(np.mean(enc_values)) if enc_values else np.nan,
     }
 
-def optimal_codon_analysis(metrics_list, top_frac=0.1, delta_threshold=0.08):
-    """Identify optimal and high-frequency codons."""
-    enc_sorted = sorted(metrics_list, key=lambda m: m["ENC"] if not np.isnan(m["ENC"]) else 999)
-    n = len(enc_sorted)
-    if n < 2:
-        return [], [], pd.Series()
-    n_top = max(1, int(n * top_frac))
-    n_low = max(1, int(n * top_frac))
-    high_group = enc_sorted[:n_top]
-    low_group = enc_sorted[-n_low:]
+def optimal_codon_analysis(metrics_list, top_frac=0.1, delta_threshold=0.08, table_id=11):
+    """
+    Identify high-frequency, high-expression, and optimal codons using the
+    published ENC/RSCU intersection method.
+
+    Method implemented
+    ------------------
+    1. Calculate whole-dataset RSCU and classify sense codons with RSCU > 1
+       as high-frequency codons.
+    2. Select the 10% CDSs with the lowest ENC values as the high-expression
+       proxy group and the 10% CDSs with the highest ENC values as the
+       low-expression proxy group.
+    3. Calculate ΔRSCU = RSCU_high_expression - RSCU_low_expression.
+    4. Classify codons with ΔRSCU >= 0.08 as high-expression codons.
+    5. Define optimal codons as codons satisfying both conditions:
+       RSCU > 1 and ΔRSCU >= 0.08.
+
+    Returns
+    -------
+    optimal_codons, high_frequency_codons, high_expression_codons,
+    delta_rscu_series, classification_df
+    """
+    if AA_TO_CODONS is None or not STOP_CODONS:
+        init_codon_maps(table_id)
+
+    valid_metrics = [m for m in metrics_list if not np.isnan(m.get("ENC", np.nan))]
+    sense_codons = [c for c in CODON_ORDER if c not in STOP_CODONS]
+
+    if len(valid_metrics) < 2:
+        empty_delta = pd.Series({c: np.nan for c in CODON_ORDER}, name="Delta_RSCU")
+        empty_df = pd.DataFrame(columns=[
+            "Codon", "Amino_acid", "Overall_RSCU", "High_expression_RSCU",
+            "Low_expression_RSCU", "Delta_RSCU", "High_frequency_RSCU_gt_1",
+            f"High_expression_Delta_ge_{delta_threshold:g}", "Optimal",
+        ])
+        return [], [], [], empty_delta, empty_df
+
+    # Whole-dataset RSCU for high-frequency codon detection (RSCU > 1).
+    total_counts = {codon: 0 for codon in CODON_ORDER}
+    for m in valid_metrics:
+        for codon, value in m.get("codon_counts", {}).items():
+            if codon in total_counts:
+                total_counts[codon] += int(value)
+    overall_rscu, codon_to_aa = rscu_from_counts(total_counts, table_id=table_id)
+
+    enc_sorted = sorted(valid_metrics, key=lambda m: m["ENC"])
+    n_ref = max(1, int(len(enc_sorted) * top_frac))
+
+    # Low ENC = stronger codon bias; used here as the high-expression proxy.
+    high_expression_group = enc_sorted[:n_ref]
+    low_expression_group = enc_sorted[-n_ref:]
 
     def avg_rscu(group):
         avg = {c: 0.0 for c in CODON_ORDER}
@@ -678,22 +763,41 @@ def optimal_codon_analysis(metrics_list, top_frac=0.1, delta_threshold=0.08):
         if n == 0:
             return avg
         for m in group:
-            for c, v in m["rscu"].items():
-                avg[c] += v / n
+            for codon, value in m.get("rscu", {}).items():
+                avg[codon] += float(value) / n
         return avg
 
-    high_avg = avg_rscu(high_group)
-    low_avg = avg_rscu(low_group)
+    high_expression_avg = avg_rscu(high_expression_group)
+    low_expression_avg = avg_rscu(low_expression_group)
+    delta = {c: high_expression_avg.get(c, 0.0) - low_expression_avg.get(c, 0.0) for c in CODON_ORDER}
 
-    delta = {c: high_avg[c] - low_avg[c] for c in CODON_ORDER}
+    high_frequency_codons = [c for c in sense_codons if overall_rscu.get(c, 0.0) > 1.0]
+    high_expression_codons = [c for c in sense_codons if delta.get(c, 0.0) >= delta_threshold]
+    optimal_codons = [c for c in sense_codons if c in high_frequency_codons and c in high_expression_codons]
 
-    # Optimal codon and HF codon lists should use sense codons only.
-    # Stop codons are displayed in the RSCU tab, but are not treated as
-    # optimal amino-acid codons.
-    sense_codons = [c for c in CODON_ORDER if c not in STOP_CODONS]
-    opt = [c for c in sense_codons if delta.get(c, 0.0) >= delta_threshold]
-    hf = [c for c in sense_codons if high_avg.get(c, 0.0) > 1.0]
-    return opt, hf, pd.Series(delta)
+    classification_rows = []
+    for codon in sense_codons:
+        is_high_frequency = overall_rscu.get(codon, 0.0) > 1.0
+        is_high_expression = delta.get(codon, 0.0) >= delta_threshold
+        classification_rows.append({
+            "Codon": codon,
+            "Amino_acid": codon_to_aa.get(codon, ""),
+            "Overall_RSCU": float(overall_rscu.get(codon, 0.0)),
+            "High_expression_RSCU": float(high_expression_avg.get(codon, 0.0)),
+            "Low_expression_RSCU": float(low_expression_avg.get(codon, 0.0)),
+            "Delta_RSCU": float(delta.get(codon, 0.0)),
+            "High_frequency_RSCU_gt_1": "Yes" if is_high_frequency else "No",
+            f"High_expression_Delta_ge_{delta_threshold:g}": "Yes" if is_high_expression else "No",
+            "Optimal": "Yes" if is_high_frequency and is_high_expression else "No",
+        })
+
+    return (
+        optimal_codons,
+        high_frequency_codons,
+        high_expression_codons,
+        pd.Series(delta, name="Delta_RSCU"),
+        pd.DataFrame(classification_rows),
+    )
 
 
 def _high_expression_reference_group(metrics_list, top_frac=0.10):
@@ -1015,6 +1119,43 @@ def build_bias_correlation_matrix(correlation_metrics_df, method="pearson"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df[metric_cols].corr(method=method)
 
+
+def _composition_metric_to_fraction(value):
+    """Normalize composition values to fractions for plotting.
+
+    GC, GC1, GC2, and GC3 are stored as fractions in per-gene metrics.
+    A3s/T3s/C3s/G3s/GC3s are exported as percentages, so values above 1
+    are divided by 100 before drawing the boxplot.
+    """
+    try:
+        if pd.isna(value):
+            return np.nan
+        value = float(value)
+    except Exception:
+        return np.nan
+    if abs(value) > 1.0:
+        value = value / 100.0
+    return value
+
+
+def build_composition_boxplot_table(metrics_list):
+    """Build the per-CDS data table for the composition-distribution boxplot.
+
+    Columns are fractions in the 0-1 range so the table can directly reproduce
+    the published-style boxplot with a vertical range/proportion axis.
+    """
+    rows = []
+    for m in metrics_list or []:
+        row = {
+            "label": m.get("label", ""),
+            "gene": m.get("gene", ""),
+            "organism": m.get("organism", ""),
+        }
+        for param in COMPOSITION_BOXPLOT_PARAMETERS:
+            row[param] = _composition_metric_to_fraction(m.get(param, np.nan))
+        rows.append(row)
+    return pd.DataFrame(rows, columns=["label", "gene", "organism"] + COMPOSITION_BOXPLOT_PARAMETERS)
+
 def generate_methods_text(data, min_codons=30, file_path=""):
     """Generate reusable methods text for paper/thesis reporting."""
     stats = data.get("genome_stats", {}) if data else {}
@@ -1032,7 +1173,7 @@ Accepted CDS before duplicate removal: {accepted}
 Skipped CDS: {skipped}
 CDS used after duplicate removal: {n_genes}
 
-RSCU was calculated by normalizing each codon count by the expected count under equal synonymous codon usage within the same amino-acid family. Stop codons were grouped together and displayed with amino-acid symbol '*'. ENC was estimated using Wright's homozygosity approach and plotted against GC3 with the expected ENC curve. PR2 was plotted as A3/(A3+T3) versus G3/(G3+C3). Neutrality analysis was performed by regressing GC12 against GC3. COA was approximated by PCA of standardized codon-frequency profiles. Optimal codons were identified using low-ENC CDS as the high-expression proxy group and high-ENC CDS as the low-expression proxy group; codons with ΔRSCU ≥ 0.08 were reported as optimal. CAI was calculated using the Sharp and Li relative-adaptiveness approach with the low-ENC reference set. CBI was calculated using Wright's codon bias index formula. FOP was calculated as the frequency of detected optimal codons within synonymous families where optimal codons were defined. A gene-by-codon RSCU matrix including all 64 codons was visualized as a heatmap ordered by average-linkage hierarchical clustering; stop codons were labelled with '*', and dendrograms were not displayed to improve readability. A publication-style stacked RSCU codon-content plot was generated by grouping sense codons under their corresponding amino acids and drawing codon-labelled colour boxes beneath the amino-acid axis. Pearson correlations among ENC, GC_all, GC1, GC2, and GC3 were summarized using a correlation heatmap.
+RSCU was calculated by normalizing each codon count by the expected count under equal synonymous codon usage within the same amino-acid family. Stop codons were grouped together and displayed with amino-acid symbol '*'. ENC was estimated using Wright's homozygosity approach and plotted against GC3 with the expected ENC curve. PR2 was plotted as A3/(A3+T3) versus G3/(G3+C3). Neutrality analysis was performed by regressing GC12 against GC3. COA was approximated by PCA of standardized codon-frequency profiles. Optimal codons were identified using the published ENC/RSCU intersection method: sense codons with whole-dataset RSCU > 1 were treated as high-frequency codons; the lowest 10% ENC CDSs were used as the high-expression proxy group and the highest 10% ENC CDSs as the low-expression proxy group; ΔRSCU was calculated as RSCU_high_expression - RSCU_low_expression; codons satisfying both RSCU > 1 and ΔRSCU ≥ 0.08 were reported as putative optimal codons. CAI was calculated using the Sharp and Li relative-adaptiveness approach with the low-ENC reference set. CBI was calculated using Wright's codon bias index formula. FOP was calculated as the frequency of detected optimal codons within synonymous families where optimal codons were defined. A gene-by-codon RSCU matrix including all 64 codons was visualized as a heatmap ordered by average-linkage hierarchical clustering; stop codons were labelled with '*', and dendrograms were not displayed to improve readability. A publication-style stacked RSCU codon-content plot was generated by grouping sense codons under their corresponding amino acids and drawing codon-labelled colour boxes beneath the amino-acid axis. A CDS nucleotide-composition and positional-GC distribution boxplot was generated from per-CDS T3s, C3s, A3s, G3s, GC, GC1, GC2, and GC3 fractions. Pearson correlations among ENC, GC_all, GC1, GC2, and GC3 were summarized using a correlation heatmap.
 """
 
 
@@ -1076,6 +1217,66 @@ BATCH_HEATMAP_CMAPS = [
     "cubehelix",
 ]
 
+
+# Colormap and ordering controls for batch-level comparative RSCU heatmaps.
+# The default green-white-pink gradient follows the style commonly used in
+# multi-species chloroplast codon-usage heatmaps.
+# Thin dendrogram strokes and compact dendrogram panels keep the comparative
+# matrix readable when many species and all 64 codons are displayed.
+# Margins for this figure are calculated in physical inches, not fixed
+# percentage fractions, so tall 100-taxon heatmaps do not develop large
+# empty spaces between the title, dendrogram, and matrix.
+COMPARATIVE_DENDROGRAM_LINEWIDTH = 0.42
+COMPARATIVE_DENDROGRAM_TOP_RATIO = 0.92
+COMPARATIVE_DENDROGRAM_LEFT_RATIO = 0.88
+COMPARATIVE_TITLE_MARGIN_IN = 0.46
+COMPARATIVE_BOTTOM_LABEL_MARGIN_IN = 1.05
+
+COMPARATIVE_RSCU_CMAPS = [
+    "green_pink_publication",
+    "viridis",
+    "cividis",
+    "plasma",
+    "magma",
+    "inferno",
+    "turbo",
+    "YlGnBu",
+    "BuGn",
+    "GnBu",
+    "PuBuGn",
+    "YlOrRd",
+    "OrRd",
+    "PuRd",
+    "BuPu",
+    "Greens",
+    "Blues",
+    "Purples",
+    "Reds",
+]
+
+COMPARATIVE_SPECIES_ORDER_OPTIONS = [
+    "hierarchical_clustering",
+    "input_order",
+    "alphabetical",
+]
+
+COMPARATIVE_CODON_ORDER_OPTIONS = [
+    "hierarchical_clustering",
+    "standard_order",
+]
+
+COMPARATIVE_OPTIMAL_CMAPS = [
+    "publication_blue",
+    "blue_green",
+    "purple_blue",
+]
+
+COMPARATIVE_OPTIMAL_STATUS_LABELS = {
+    0: "Not high-frequency",
+    1: "High-frequency only (RSCU > 1)",
+    2: "Optimal (RSCU > 1 and ΔRSCU ≥ 0.08)",
+}
+
 CORRELATION_CMAPS = [
     "coolwarm",
     "RdBu_r",
@@ -1091,6 +1292,32 @@ CORRELATION_CMAPS = [
     "RdYlGn",
     "twilight",
     "twilight_shifted",
+]
+
+# Parameters used by the CDS composition boxplot. The order mirrors
+# common chloroplast CDS nucleotide-composition figures in codon-usage papers.
+COMPOSITION_BOXPLOT_PARAMETERS = ["T3s", "C3s", "A3s", "G3s", "GC", "GC1", "GC2", "GC3"]
+
+# Colormaps exposed for the CDS composition boxplot in single and batch modes.
+COMPOSITION_BOXPLOT_CMAPS = [
+    "Set3",
+    "Pastel1",
+    "Pastel2",
+    "Paired",
+    "Accent",
+    "Dark2",
+    "tab10",
+    "tab20",
+    "viridis",
+    "cividis",
+    "plasma",
+    "magma",
+    "turbo",
+    "YlGnBu",
+    "BuGn",
+    "Greens",
+    "Blues",
+    "Oranges",
 ]
 
 # Amino-acid display order used by the publication-style RSCU stacked
@@ -1220,7 +1447,8 @@ def analyze_genbank_file(file_path, min_codons=30, table_id=11):
     rscu_heatmap_df = build_rscu_heatmap_matrix(metrics_list, table_id=table_id)
     correlation_metrics_df = build_correlation_metrics_table(metrics_list)
     correlation_matrix_df = build_bias_correlation_matrix(correlation_metrics_df, method="pearson")
-    opt_codons, hf_codons, delta_rscu = optimal_codon_analysis(metrics_list)
+    composition_boxplot_df = build_composition_boxplot_table(metrics_list)
+    opt_codons, hf_codons, high_expression_codons, delta_rscu, optimal_codon_classification_df = optimal_codon_analysis(metrics_list, table_id=table_id)
 
     cai_weights = build_cai_weights_sharp_li(metrics_list, top_frac=0.10, table_id=table_id)
     genome_cai = calculate_cai_sharp_li(metrics_list, cai_weights)
@@ -1295,12 +1523,15 @@ def analyze_genbank_file(file_path, min_codons=30, table_id=11):
         "rscu_heatmap_df": rscu_heatmap_df,
         "correlation_metrics_df": correlation_metrics_df,
         "correlation_matrix_df": correlation_matrix_df,
+        "composition_boxplot_df": composition_boxplot_df,
         "qc_df": qc_df,
         "duplicate_df": duplicate_df,
         "methods_text": generate_methods_text({"genome_stats": genome_stats, "qc_df": qc_df}, min_codons=int(min_codons), file_path=file_path),
         "opt_codons": opt_codons,
         "hf_codons": hf_codons,
+        "high_expression_codons": high_expression_codons,
         "delta_rscu": delta_rscu,
+        "optimal_codon_classification_df": optimal_codon_classification_df,
         "cai_weights": cai_weights,
         "df_enc": df_enc,
         "df_pr2": df_pr2,
@@ -1397,6 +1628,9 @@ def build_output_tables_from_data(data):
             "ENC": m["ENC"], "ENC_expected": m.get("ENC_exp", np.nan),
             "total_codons": m["total_codons"],
             "A3": m["A3"], "T3": m["T3"], "G3": m["G3"], "C3": m["C3"],
+            "A3s": m.get("A3s", np.nan), "T3s": m.get("T3s", np.nan),
+            "C3s": m.get("C3s", np.nan), "G3s": m.get("G3s", np.nan),
+            "GC3s": m.get("GC3s", np.nan),
             "AT_bias": m["AT_bias"], "GC_bias": m["GC_bias"],
             "CAI": m.get("CAI", np.nan), "CBI": m.get("CBI", np.nan), "FOP": m.get("FOP", np.nan),
         } for m in metrics_list])
@@ -1409,11 +1643,18 @@ def build_output_tables_from_data(data):
     tables["optimal_codons"] = pd.DataFrame({"Optimal": opt})
 
     hf = data.get("hf_codons", [])
-    tables["high_freq_codons"] = pd.DataFrame({"High_Frequency": hf})
+    tables["high_freq_codons"] = pd.DataFrame({"High_Frequency_RSCU_gt_1": hf})
+
+    high_expr = data.get("high_expression_codons", [])
+    tables["high_expression_codons"] = pd.DataFrame({"High_Expression_Delta_RSCU_ge_0_08": high_expr})
 
     delta = data.get("delta_rscu", pd.Series(dtype=float))
     if delta is not None and not delta.empty:
         tables["delta_rscu"] = delta.rename("Delta_RSCU").reset_index().rename(columns={"index": "Codon"})
+
+    opt_class_df = data.get("optimal_codon_classification_df")
+    if opt_class_df is not None:
+        tables["optimal_codon_classification"] = opt_class_df
 
     cai_weights = data.get("cai_weights", {})
     if cai_weights:
@@ -1434,6 +1675,10 @@ def build_output_tables_from_data(data):
     corr_matrix = data.get("correlation_matrix_df")
     if corr_matrix is not None:
         tables["correlation_matrix"] = corr_matrix.reset_index().rename(columns={"index": "Metric"})
+
+    composition_df = data.get("composition_boxplot_df")
+    if composition_df is not None:
+        tables["composition_boxplot_data"] = composition_df
 
     df_enc = data.get("df_enc")
     if df_enc is not None:
@@ -1590,6 +1835,81 @@ def create_pr2_figure(data, width, height, label_top, palette):
     cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label("CDS length (codons)")
     style_colorbar_static(cbar, palette)
+    fig.tight_layout()
+    return fig
+
+
+def create_composition_boxplot_figure(data, width, height, palette,
+                                      color_mode="by_parameter", cmap_name="Set3",
+                                      single_color="#66b7a8"):
+    """Create the CDS Nucleotide Composition and Positional GC Distribution boxplot.
+
+    The plot follows the published-style layout: T3s, C3s, A3s, G3s, GC,
+    GC1, GC2, and GC3 on the x-axis and fractional range on the y-axis.
+    """
+    df = data.get("composition_boxplot_df")
+    if df is None:
+        df = build_composition_boxplot_table(data.get("metrics_list", []))
+
+    fig, ax = make_batch_figure(width, height, palette)
+    if df is None or df.empty:
+        ax.text(0.5, 0.5, "No data available", ha="center", va="center", transform=ax.transAxes, color=palette["text"])
+        fig.tight_layout()
+        return fig
+
+    plot_df = df.copy()
+    for param in COMPOSITION_BOXPLOT_PARAMETERS:
+        plot_df[param] = pd.to_numeric(plot_df.get(param, np.nan), errors="coerce").map(_composition_metric_to_fraction)
+
+    values = [plot_df[param].dropna().to_numpy(dtype=float) for param in COMPOSITION_BOXPLOT_PARAMETERS]
+    if not any(len(v) for v in values):
+        ax.text(0.5, 0.5, "No valid composition values", ha="center", va="center", transform=ax.transAxes, color=palette["text"])
+        fig.tight_layout()
+        return fig
+
+    bplot = ax.boxplot(
+        values,
+        labels=COMPOSITION_BOXPLOT_PARAMETERS,
+        patch_artist=True,
+        widths=0.58,
+        showmeans=True,
+        meanprops=dict(marker="D", markerfacecolor=palette.get("line", "#111111"),
+                       markeredgecolor=palette.get("line", "#111111"), markersize=4.5),
+        medianprops=dict(color=palette.get("line", "#111111"), linewidth=1.8),
+        whiskerprops=dict(color=palette.get("line", "#111111"), linewidth=1.4),
+        capprops=dict(color=palette.get("line", "#111111"), linewidth=1.4),
+        boxprops=dict(color=palette.get("line", "#111111"), linewidth=1.5),
+        flierprops=dict(marker="o", markerfacecolor=palette.get("accent", "#d99a2b"),
+                        markeredgecolor=palette.get("line", "#111111"), markersize=4.0, alpha=0.85),
+    )
+
+    if color_mode == "single_color":
+        colors = [single_color] * len(COMPOSITION_BOXPLOT_PARAMETERS)
+    else:
+        colors = _sample_cmap_colors(cmap_name or palette.get("cmap", "Set3"), len(COMPOSITION_BOXPLOT_PARAMETERS))
+
+    for patch, color in zip(bplot["boxes"], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.86)
+        patch.set_edgecolor(palette.get("line", "#111111"))
+
+    organism = ""
+    try:
+        records = data.get("records", [])
+        organism = str(records[0].get("organism", "")).strip() if records else ""
+    except Exception:
+        organism = ""
+
+    title = organism if organism else "CDS Nucleotide Composition and Positional GC Distribution"
+    ax.set_title(title, fontsize=15, fontweight="bold", fontstyle="italic" if organism else "normal", pad=12)
+    ax.set_ylabel("Range", fontsize=12)
+    ax.set_xlabel("")
+    ax.set_ylim(0.0, 1.0)
+    ax.tick_params(axis="x", labelrotation=0, labelsize=10)
+    ax.tick_params(axis="y", labelsize=10)
+    style_axes_static(fig, ax, palette)
+    ax.grid(True, axis="y", linestyle="--", alpha=0.32, color=palette["grid"])
+    ax.grid(False, axis="x")
     fig.tight_layout()
     return fig
 
@@ -1776,6 +2096,704 @@ def create_rscu_heatmap_figure(data, width, height, palette):
     left_margin = min(0.18, max(0.075, 0.060 + max_label_len * 0.0032))
     fig.subplots_adjust(left=left_margin, right=0.965, bottom=0.165, top=0.905)
     return fig
+
+
+
+def _make_unique_labels(labels):
+    """Return labels made unique while preserving their first occurrence."""
+    seen = defaultdict(int)
+    unique = []
+    for raw in labels:
+        base = str(raw or "Unknown_species").strip() or "Unknown_species"
+        seen[base] += 1
+        unique.append(base if seen[base] == 1 else f"{base}_{seen[base]}")
+    return unique
+
+
+def _species_name_from_analysis_data(data, fallback_name=""):
+    """Extract the most useful species/organism name from one analysis result."""
+    records = data.get("records", []) if isinstance(data, dict) else []
+    for rec in records:
+        organism = str(rec.get("organism", "")).strip()
+        if organism:
+            return organism
+    if fallback_name:
+        return Path(str(fallback_name)).stem
+    input_file = data.get("input_file", "") if isinstance(data, dict) else ""
+    return Path(str(input_file)).stem if input_file else "Unknown_species"
+
+
+def build_comparative_rscu_matrix(batch_success_items, table_id=11):
+    """
+    Build a species × 64-codon RSCU matrix from successful batch analyses.
+
+    Rows represent species/files and columns represent all 64 DNA codons in the
+    standard ChloroCodon codon order. Values are genome-level RSCU values
+    calculated from accepted duplicate-filtered CDSs for each GenBank file.
+    """
+    init_codon_maps(table_id)
+    if not batch_success_items:
+        return pd.DataFrame(columns=["Species", "File"] + CODON_ORDER)
+
+    rows = []
+    raw_species_labels = []
+    for item in batch_success_items:
+        data = item.get("data", {})
+        file_name = item.get("file_name", "")
+        species = _species_name_from_analysis_data(data, fallback_name=file_name)
+        raw_species_labels.append(species)
+
+        rscu_df = data.get("rscu_publication_df")
+        rscu_values = {codon: 0.0 for codon in CODON_ORDER}
+        if rscu_df is not None and not rscu_df.empty and {"Codon", "RSCU"}.issubset(rscu_df.columns):
+            tmp = rscu_df.copy()
+            tmp["Codon"] = tmp["Codon"].astype(str)
+            tmp["RSCU"] = pd.to_numeric(tmp["RSCU"], errors="coerce").fillna(0.0)
+            rscu_values.update(dict(zip(tmp["Codon"], tmp["RSCU"])))
+        else:
+            overall_rscu = data.get("overall_rscu", ({}, {}))
+            if isinstance(overall_rscu, tuple) and overall_rscu:
+                rscu_dict = overall_rscu[0]
+                for codon in CODON_ORDER:
+                    rscu_values[codon] = float(rscu_dict.get(codon, 0.0))
+
+        row = {"Species": species, "File": str(file_name)}
+        for codon in CODON_ORDER:
+            row[codon] = float(rscu_values.get(codon, 0.0))
+        rows.append(row)
+
+    unique_species = _make_unique_labels(raw_species_labels)
+    for row, label in zip(rows, unique_species):
+        row["Species"] = label
+
+    return pd.DataFrame(rows, columns=["Species", "File"] + CODON_ORDER)
+
+
+
+def _sense_codon_order_for_table(table_id=11):
+    """Return codons that encode amino acids for the selected NCBI table."""
+    init_codon_maps(table_id)
+    return [codon for codon in CODON_ORDER if codon not in STOP_CODONS]
+
+
+def build_comparative_optimal_codon_matrix(batch_success_items, table_id=11):
+    """
+    Build a species × sense-codon categorical matrix for comparative optimal-codon analysis.
+
+    Status coding follows the published RSCU/ΔRSCU intersection method:
+    0 = not high-frequency, 1 = high-frequency only (RSCU > 1),
+    2 = optimal codon (RSCU > 1 and ΔRSCU >= 0.08).
+
+    Stop codons are excluded because they are not amino-acid optimal codons.
+    """
+    sense_codons = _sense_codon_order_for_table(table_id)
+    if not batch_success_items:
+        return pd.DataFrame(columns=["Species", "File"] + sense_codons)
+
+    rows = []
+    raw_species_labels = []
+    for item in batch_success_items:
+        data = item.get("data", {})
+        file_name = item.get("file_name", "")
+        species = _species_name_from_analysis_data(data, fallback_name=file_name)
+        raw_species_labels.append(species)
+
+        status_values = {codon: 0 for codon in sense_codons}
+        class_df = data.get("optimal_codon_classification_df")
+        if class_df is not None and not class_df.empty and "Codon" in class_df.columns:
+            tmp = class_df.copy()
+            tmp["Codon"] = tmp["Codon"].astype(str)
+            for _, r in tmp.iterrows():
+                codon = str(r.get("Codon", ""))
+                if codon not in status_values:
+                    continue
+                high_freq = str(r.get("High_frequency_RSCU_gt_1", "")).strip().lower() == "yes"
+                optimal = str(r.get("Optimal", "")).strip().lower() == "yes"
+                if optimal:
+                    status_values[codon] = 2
+                elif high_freq:
+                    status_values[codon] = 1
+                else:
+                    status_values[codon] = 0
+        else:
+            # Fallback for old cached analysis objects: use the exported codon lists if
+            # the classification table is unavailable.
+            high_freq_set = set(data.get("hf_codons", []) or [])
+            optimal_set = set(data.get("opt_codons", []) or [])
+            for codon in sense_codons:
+                if codon in optimal_set:
+                    status_values[codon] = 2
+                elif codon in high_freq_set:
+                    status_values[codon] = 1
+
+        row = {"Species": species, "File": str(file_name)}
+        for codon in sense_codons:
+            row[codon] = int(status_values.get(codon, 0))
+        rows.append(row)
+
+    unique_species = _make_unique_labels(raw_species_labels)
+    for row, label in zip(rows, unique_species):
+        row["Species"] = label
+
+    return pd.DataFrame(rows, columns=["Species", "File"] + sense_codons)
+
+
+def build_comparative_optimal_codon_long_table(comparative_optimal_df, table_id=11):
+    """Return a long-form table with codon optimal-codon status per species."""
+    sense_codons = _sense_codon_order_for_table(table_id)
+    if comparative_optimal_df is None or comparative_optimal_df.empty:
+        return pd.DataFrame(columns=["Species", "File", "Codon", "Status_code", "Status"])
+    rows = []
+    for _, row in comparative_optimal_df.iterrows():
+        species = row.get("Species", "")
+        file_name = row.get("File", "")
+        for codon in sense_codons:
+            if codon not in comparative_optimal_df.columns:
+                continue
+            try:
+                code = int(row.get(codon, 0))
+            except Exception:
+                code = 0
+            rows.append({
+                "Species": species,
+                "File": file_name,
+                "Codon": codon,
+                "Status_code": code,
+                "Status": COMPARATIVE_OPTIMAL_STATUS_LABELS.get(code, "Unknown"),
+            })
+    return pd.DataFrame(rows)
+
+
+def _get_comparative_rscu_colormap(cmap_name="green_pink_publication"):
+    """Return a Matplotlib colormap object/name for comparative RSCU heatmaps."""
+    name = str(cmap_name or "green_pink_publication")
+    if name == "green_pink_publication":
+        return LinearSegmentedColormap.from_list(
+            "green_pink_publication",
+            ["#59bf6b", "#f8f8f8", "#b05bb8"],
+            N=256,
+        )
+    return name
+
+
+def _linkage_and_order(values, labels, order_mode="hierarchical_clustering", axis="rows"):
+    """Return (order, linkage_matrix_or_None) for rows or columns."""
+    n = values.shape[0] if axis == "rows" else values.shape[1]
+    if n <= 1:
+        return list(range(n)), None
+
+    if order_mode == "input_order":
+        return list(range(n)), None
+
+    if order_mode == "alphabetical" and axis == "rows":
+        return sorted(range(n), key=lambda i: str(labels[i]).lower()), None
+
+    # For columns, any non-clustering request falls back to the biological
+    # CODON_ORDER already present in the matrix.
+    if order_mode != "hierarchical_clustering":
+        return list(range(n)), None
+
+    try:
+        arr = values if axis == "rows" else values.T
+        arr = np.nan_to_num(np.asarray(arr, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+        if arr.shape[0] < 2:
+            return list(range(n)), None
+        link = linkage(pdist(arr, metric="euclidean"), method="average")
+        order = dendrogram(link, no_plot=True)["leaves"]
+        return list(order), link
+    except Exception:
+        return list(range(n)), None
+
+
+def create_comparative_rscu_heatmap_figure(
+    comparative_rscu_df,
+    width,
+    height,
+    palette,
+    cmap_name="green_pink_publication",
+    species_order="hierarchical_clustering",
+    codon_order="hierarchical_clustering",
+    show_dendrograms=True,
+):
+    """
+    Create a comparative multi-species RSCU heatmap.
+
+    Horizontal axis = 64 codons; vertical axis = species/file names.
+    Cell colour intensity = genome-level RSCU value for each codon in each species.
+    """
+    base_width = max(float(width or 10.0), 11.0)
+    base_height = max(float(height or 6.0), 4.8)
+
+    if comparative_rscu_df is None or comparative_rscu_df.empty:
+        fig, ax = make_batch_figure(base_width, base_height, palette)
+        ax.text(0.5, 0.5, "No comparative RSCU data available", ha="center", va="center",
+                transform=ax.transAxes, color=palette["text"])
+        fig.tight_layout()
+        return fig
+
+    codon_cols = [c for c in CODON_ORDER if c in comparative_rscu_df.columns]
+    if not codon_cols:
+        fig, ax = make_batch_figure(base_width, base_height, palette)
+        ax.text(0.5, 0.5, "No codon columns available", ha="center", va="center",
+                transform=ax.transAxes, color=palette["text"])
+        fig.tight_layout()
+        return fig
+
+    matrix_df = comparative_rscu_df.copy()
+    species_labels = matrix_df["Species"].astype(str).tolist() if "Species" in matrix_df.columns else [f"Species_{i+1}" for i in range(len(matrix_df))]
+    values_df = matrix_df[codon_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    values = values_df.to_numpy(dtype=float)
+
+    if values.shape[0] < 1 or values.shape[1] < 1:
+        fig, ax = make_batch_figure(base_width, base_height, palette)
+        ax.text(0.5, 0.5, "No comparative RSCU data available", ha="center", va="center",
+                transform=ax.transAxes, color=palette["text"])
+        fig.tight_layout()
+        return fig
+
+    row_order, row_link = _linkage_and_order(values, species_labels, species_order, axis="rows")
+    col_order, col_link = _linkage_and_order(values, codon_cols, codon_order, axis="columns")
+
+    ordered_values = values[np.ix_(row_order, col_order)]
+    ordered_species = [species_labels[i] for i in row_order]
+    ordered_codons = [codon_cols[i] for i in col_order]
+
+    n_rows, n_cols = ordered_values.shape
+    effective_width = min(30.0, max(base_width, 11.5, 0.135 * n_cols + 3.6))
+    effective_height = min(30.0, max(base_height, 3.7 + 0.23 * n_rows))
+
+    fig = Figure(figsize=(effective_width, effective_height), dpi=100)
+    fig.patch.set_facecolor(palette["figure_bg"])
+
+    use_col_dend = bool(show_dendrograms and col_link is not None and codon_order == "hierarchical_clustering")
+    use_row_dend = bool(show_dendrograms and row_link is not None and species_order == "hierarchical_clustering")
+
+    top_ratio = COMPARATIVE_DENDROGRAM_TOP_RATIO if use_col_dend else 0.16
+    left_ratio = COMPARATIVE_DENDROGRAM_LEFT_RATIO if use_row_dend else 0.12
+    max_label_len_for_layout = max((len(x) for x in ordered_species), default=8)
+    label_space_ratio = min(3.2, max(1.15, max_label_len_for_layout * 0.088))
+    gs = fig.add_gridspec(
+        2,
+        4,
+        width_ratios=[left_ratio, 10.0, label_space_ratio, 0.42],
+        height_ratios=[top_ratio, 10.0],
+        wspace=0.045,
+        hspace=0.035,
+    )
+    ax_col = fig.add_subplot(gs[0, 1])
+    ax_row = fig.add_subplot(gs[1, 0])
+    ax = fig.add_subplot(gs[1, 1])
+    ax_label_space = fig.add_subplot(gs[1, 2])
+    ax_label_space.axis("off")
+    cax = fig.add_subplot(gs[1, 3])
+
+    # Dendrograms are intentionally monochrome to match journal-style heatmaps.
+    dendro_color = palette.get("text", "#222222")
+    if use_col_dend:
+        dendrogram(col_link, ax=ax_col, no_labels=True, color_threshold=0,
+                   above_threshold_color=dendro_color, link_color_func=lambda _: dendro_color)
+        for dendro_collection in ax_col.collections:
+            dendro_collection.set_linewidth(COMPARATIVE_DENDROGRAM_LINEWIDTH)
+        for dendro_line in ax_col.lines:
+            dendro_line.set_linewidth(COMPARATIVE_DENDROGRAM_LINEWIDTH)
+        ax_col.set_xticks([])
+        ax_col.set_yticks([])
+        for spine in ax_col.spines.values():
+            spine.set_visible(False)
+    else:
+        ax_col.axis("off")
+
+    if use_row_dend:
+        dendrogram(row_link, ax=ax_row, orientation="left", no_labels=True, color_threshold=0,
+                   above_threshold_color=dendro_color, link_color_func=lambda _: dendro_color)
+        for dendro_collection in ax_row.collections:
+            dendro_collection.set_linewidth(COMPARATIVE_DENDROGRAM_LINEWIDTH)
+        for dendro_line in ax_row.lines:
+            dendro_line.set_linewidth(COMPARATIVE_DENDROGRAM_LINEWIDTH)
+        ax_row.set_xticks([])
+        ax_row.set_yticks([])
+        for spine in ax_row.spines.values():
+            spine.set_visible(False)
+    else:
+        ax_row.axis("off")
+
+    cmap = _get_comparative_rscu_colormap(cmap_name)
+    vmax = float(np.nanmax(ordered_values)) if np.isfinite(np.nanmax(ordered_values)) else 1.0
+    vmax = max(vmax, 1.0)
+    im = ax.imshow(ordered_values, aspect="auto", interpolation="nearest", cmap=cmap, vmin=0.0, vmax=vmax)
+
+    ax.set_facecolor(palette["axes_bg"])
+    # Keep the title close to the dendrogram/matrix even for very tall figures.
+    # A fixed top=0.90 layout leaves a huge blank gap when 80-100 taxa force
+    # the figure height to increase, so title placement is calculated using
+    # physical inches instead of a fixed percentage of the figure.
+    title_y = min(0.997, 1.0 - (0.06 / effective_height))
+    fig.suptitle("Comparative Multi-species RSCU Heatmap", fontsize=13.5,
+                 fontweight="bold", color=palette["text"], y=title_y)
+
+    # Vertical codon labels are the safest layout for 64 codons. Each label is
+    # positioned at the exact centre of its heatmap column and drawn outside the
+    # matrix area, avoiding the diagonal-label intrusion seen in crowded previews.
+    x_font = 5.8 if n_cols >= 64 else 6.8
+    if n_rows > 80:
+        y_font = 4.0
+    elif n_rows > 60:
+        y_font = 4.6
+    elif n_rows > 40:
+        y_font = 5.4
+    elif n_rows > 25:
+        y_font = 6.2
+    else:
+        y_font = 7.6
+
+    ax.set_xlim(-0.5, n_cols - 0.5)
+    ax.set_xticks(np.arange(n_cols))
+    ax.set_xticklabels(
+        ordered_codons,
+        rotation=90,
+        ha="center",
+        va="top",
+        rotation_mode="default",
+        fontsize=x_font,
+        color=palette["text"],
+    )
+    ax.xaxis.set_ticks_position("bottom")
+    ax.tick_params(axis="x", colors=palette["text"], length=0.0, pad=4.0)
+
+    ax.set_yticks(np.arange(n_rows))
+    ax.set_yticklabels(ordered_species, fontsize=y_font, fontstyle="italic", color=palette["text"])
+    ax.yaxis.tick_right()
+    ax.yaxis.set_label_position("right")
+    ax.tick_params(axis="y", colors=palette["text"], length=0.0, pad=2.0)
+    ax.set_xlabel("Codons", fontsize=9.5, color=palette["text"], labelpad=18)
+    ax.set_ylabel("")
+
+    # White cell separators reproduce the published matrix appearance while
+    # keeping the plot readable at 64 codons and up to 100 species.
+    ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
+    ax.grid(which="minor", color="#ffffff", linestyle="-", linewidth=0.34, alpha=0.85)
+    ax.tick_params(which="minor", bottom=False, left=False)
+
+    for spine in ax.spines.values():
+        spine.set_color(palette["text"])
+        spine.set_linewidth(0.55)
+
+    cbar = fig.colorbar(im, cax=cax)
+    cbar.set_label("RSCU", color=palette["text"], labelpad=7)
+    style_colorbar_static(cbar, palette)
+
+    # Use physical-inch margins instead of fixed percentage margins. This keeps
+    # the title-to-dendrogram gap compact in tall 100-taxon figures and still
+    # reserves enough bottom space for vertical codon labels in smaller figures.
+    top_margin_in = COMPARATIVE_TITLE_MARGIN_IN if use_col_dend else 0.38
+    axes_top = min(0.986, max(0.850, 1.0 - (top_margin_in / effective_height)))
+    bottom_margin_in = COMPARATIVE_BOTTOM_LABEL_MARGIN_IN if n_cols >= 50 else 0.78
+    axes_bottom = min(0.240, max(0.040, bottom_margin_in / effective_height))
+
+    fig.subplots_adjust(left=0.035 if use_row_dend else 0.045,
+                        right=0.970,
+                        bottom=axes_bottom,
+                        top=axes_top)
+    return fig
+
+
+def save_comparative_rscu_outputs(comparative_rscu_df, output_dir, settings, prefix="Comparative_Multi_species_RSCU_Heatmap"):
+    """Save comparative RSCU matrix and selected figure formats into output_dir."""
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if comparative_rscu_df is None or comparative_rscu_df.empty:
+        return
+
+    safe_prefix = sanitize_filename(prefix, fallback="Comparative_RSCU_Heatmap")
+    comparative_rscu_df.to_csv(out_dir / f"{safe_prefix}.matrix.csv", index=False)
+
+    if len(comparative_rscu_df) < 2 or not settings.get("save_figures", True):
+        return
+
+    formats = list(settings.get("formats", []) or [])
+    if not formats:
+        return
+
+    palette = get_plot_palette_by_name(settings.get("comparative_palette_name", settings.get("palette_name", "default")))
+    fig = create_comparative_rscu_heatmap_figure(
+        comparative_rscu_df,
+        settings.get("fig_width", 12.0),
+        settings.get("fig_height", 7.0),
+        palette,
+        cmap_name=settings.get("comparative_rscu_cmap_name", "green_pink_publication"),
+        species_order=settings.get("comparative_species_order", "hierarchical_clustering"),
+        codon_order=settings.get("comparative_codon_order", "hierarchical_clustering"),
+        show_dendrograms=settings.get("comparative_show_dendrograms", True),
+    )
+    try:
+        for fmt in formats:
+            fmt = str(fmt or "png").lower().strip()
+            if fmt == "tif":
+                fmt = "tiff"
+            if fmt not in {"png", "pdf", "svg", "tiff"}:
+                continue
+            ext = "tiff" if fmt == "tiff" else fmt
+            save_kwargs = {"format": fmt, "bbox_inches": "tight"}
+            if fmt in {"png", "tiff"}:
+                save_kwargs["dpi"] = EXPORT_DPI
+            fig.savefig(out_dir / f"{safe_prefix}.{ext}", **save_kwargs)
+    finally:
+        try:
+            plt.close(fig)
+        except Exception:
+            pass
+
+
+
+def _get_comparative_optimal_colormap(cmap_name="publication_blue"):
+    """Return discrete colormap/norm for comparative optimal-codon heatmaps."""
+    name = str(cmap_name or "publication_blue")
+    if name == "blue_green":
+        colors = ["#f1f5f9", "#ffffff", "#a7f3d0"]
+    elif name == "purple_blue":
+        colors = ["#f3f4f6", "#ffffff", "#c7d2fe"]
+    else:
+        # Publication-style: neutral background, white preferred codons, light blue optimal codons.
+        colors = ["#eceff1", "#ffffff", "#b7e3f4"]
+    cmap = ListedColormap(colors, name=f"comparative_optimal_{name}")
+    norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5], cmap.N)
+    return cmap, norm, colors
+
+
+def create_comparative_optimal_codon_heatmap_figure(
+    comparative_optimal_df,
+    width,
+    height,
+    palette,
+    cmap_name="publication_blue",
+    species_order="hierarchical_clustering",
+    codon_order="hierarchical_clustering",
+    show_dendrograms=True,
+    table_id=11,
+):
+    """
+    Create a comparative multi-species optimal codon heatmap.
+
+    Horizontal axis = sense codons; vertical axis = species/file names.
+    Cell status = 0 not high-frequency, 1 high-frequency only, 2 optimal.
+    """
+    base_width = max(float(width or 10.0), 11.0)
+    base_height = max(float(height or 6.0), 4.8)
+
+    if comparative_optimal_df is None or comparative_optimal_df.empty:
+        fig, ax = make_batch_figure(base_width, base_height, palette)
+        ax.text(0.5, 0.5, "No comparative optimal-codon data available", ha="center", va="center",
+                transform=ax.transAxes, color=palette["text"])
+        fig.tight_layout()
+        return fig
+
+    sense_codons = [c for c in _sense_codon_order_for_table(table_id) if c in comparative_optimal_df.columns]
+    if not sense_codons:
+        fig, ax = make_batch_figure(base_width, base_height, palette)
+        ax.text(0.5, 0.5, "No sense-codon columns available", ha="center", va="center",
+                transform=ax.transAxes, color=palette["text"])
+        fig.tight_layout()
+        return fig
+
+    matrix_df = comparative_optimal_df.copy()
+    species_labels = matrix_df["Species"].astype(str).tolist() if "Species" in matrix_df.columns else [f"Species_{i+1}" for i in range(len(matrix_df))]
+    values_df = matrix_df[sense_codons].apply(pd.to_numeric, errors="coerce").fillna(0).clip(lower=0, upper=2)
+    values = values_df.to_numpy(dtype=float)
+
+    if values.shape[0] < 1 or values.shape[1] < 1:
+        fig, ax = make_batch_figure(base_width, base_height, palette)
+        ax.text(0.5, 0.5, "No comparative optimal-codon data available", ha="center", va="center",
+                transform=ax.transAxes, color=palette["text"])
+        fig.tight_layout()
+        return fig
+
+    row_order, row_link = _linkage_and_order(values, species_labels, species_order, axis="rows")
+    col_order, col_link = _linkage_and_order(values, sense_codons, codon_order, axis="columns")
+
+    ordered_values = values[np.ix_(row_order, col_order)]
+    ordered_species = [species_labels[i] for i in row_order]
+    ordered_codons = [sense_codons[i] for i in col_order]
+
+    n_rows, n_cols = ordered_values.shape
+    effective_width = min(30.0, max(base_width, 11.5, 0.145 * n_cols + 3.7))
+    effective_height = min(30.0, max(base_height, 3.7 + 0.23 * n_rows))
+
+    fig = Figure(figsize=(effective_width, effective_height), dpi=100)
+    fig.patch.set_facecolor(palette["figure_bg"])
+
+    use_col_dend = bool(show_dendrograms and col_link is not None and codon_order == "hierarchical_clustering")
+    use_row_dend = bool(show_dendrograms and row_link is not None and species_order == "hierarchical_clustering")
+
+    top_ratio = COMPARATIVE_DENDROGRAM_TOP_RATIO if use_col_dend else 0.16
+    left_ratio = COMPARATIVE_DENDROGRAM_LEFT_RATIO if use_row_dend else 0.12
+    max_label_len_for_layout = max((len(x) for x in ordered_species), default=8)
+    label_space_ratio = min(3.2, max(1.15, max_label_len_for_layout * 0.088))
+    gs = fig.add_gridspec(
+        2,
+        4,
+        width_ratios=[left_ratio, 10.0, label_space_ratio, 0.42],
+        height_ratios=[top_ratio, 10.0],
+        wspace=0.045,
+        hspace=0.035,
+    )
+    ax_col = fig.add_subplot(gs[0, 1])
+    ax_row = fig.add_subplot(gs[1, 0])
+    ax = fig.add_subplot(gs[1, 1])
+    ax_label_space = fig.add_subplot(gs[1, 2])
+    ax_label_space.axis("off")
+    legend_ax = fig.add_subplot(gs[1, 3])
+    legend_ax.axis("off")
+
+    dendro_color = palette.get("text", "#222222")
+    if use_col_dend:
+        dendrogram(col_link, ax=ax_col, no_labels=True, color_threshold=0,
+                   above_threshold_color=dendro_color, link_color_func=lambda _: dendro_color)
+        for dendro_collection in ax_col.collections:
+            dendro_collection.set_linewidth(COMPARATIVE_DENDROGRAM_LINEWIDTH)
+        for dendro_line in ax_col.lines:
+            dendro_line.set_linewidth(COMPARATIVE_DENDROGRAM_LINEWIDTH)
+        ax_col.set_xticks([])
+        ax_col.set_yticks([])
+        for spine in ax_col.spines.values():
+            spine.set_visible(False)
+    else:
+        ax_col.axis("off")
+
+    if use_row_dend:
+        dendrogram(row_link, ax=ax_row, orientation="left", no_labels=True, color_threshold=0,
+                   above_threshold_color=dendro_color, link_color_func=lambda _: dendro_color)
+        for dendro_collection in ax_row.collections:
+            dendro_collection.set_linewidth(COMPARATIVE_DENDROGRAM_LINEWIDTH)
+        for dendro_line in ax_row.lines:
+            dendro_line.set_linewidth(COMPARATIVE_DENDROGRAM_LINEWIDTH)
+        ax_row.set_xticks([])
+        ax_row.set_yticks([])
+        for spine in ax_row.spines.values():
+            spine.set_visible(False)
+    else:
+        ax_row.axis("off")
+
+    cmap, norm, colors = _get_comparative_optimal_colormap(cmap_name)
+    im = ax.imshow(ordered_values, aspect="auto", interpolation="nearest", cmap=cmap, norm=norm)
+
+    ax.set_facecolor(palette["axes_bg"])
+    title_y = min(0.997, 1.0 - (0.06 / effective_height))
+    fig.suptitle("Comparative Multi-species Optimal Codon Heatmap", fontsize=13.5,
+                 fontweight="bold", color=palette["text"], y=title_y)
+
+    x_font = 5.8 if n_cols >= 55 else 6.8
+    if n_rows > 80:
+        y_font = 4.0
+    elif n_rows > 60:
+        y_font = 4.6
+    elif n_rows > 40:
+        y_font = 5.4
+    elif n_rows > 25:
+        y_font = 6.2
+    else:
+        y_font = 7.6
+
+    ax.set_xlim(-0.5, n_cols - 0.5)
+    ax.set_xticks(np.arange(n_cols))
+    ax.set_xticklabels(
+        ordered_codons,
+        rotation=90,
+        ha="center",
+        va="top",
+        rotation_mode="default",
+        fontsize=x_font,
+        color=palette["text"],
+    )
+    ax.xaxis.set_ticks_position("bottom")
+    ax.tick_params(axis="x", colors=palette["text"], length=0.0, pad=4.0)
+
+    ax.set_yticks(np.arange(n_rows))
+    ax.set_yticklabels(ordered_species, fontsize=y_font, fontstyle="italic", color=palette["text"])
+    ax.yaxis.tick_right()
+    ax.yaxis.set_label_position("right")
+    ax.tick_params(axis="y", colors=palette["text"], length=0.0, pad=2.0)
+    ax.set_xlabel("Sense codons", fontsize=9.5, color=palette["text"], labelpad=18)
+    ax.set_ylabel("")
+
+    ax.set_xticks(np.arange(-0.5, n_cols, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, n_rows, 1), minor=True)
+    ax.grid(which="minor", color="#d1d5db", linestyle="-", linewidth=0.32, alpha=0.85)
+    ax.tick_params(which="minor", bottom=False, left=False)
+
+    for spine in ax.spines.values():
+        spine.set_color(palette["text"])
+        spine.set_linewidth(0.55)
+
+    legend_handles = [
+        Patch(facecolor=colors[2], edgecolor="#6b7280", label="Optimal: RSCU > 1 and ΔRSCU ≥ 0.08"),
+        Patch(facecolor=colors[1], edgecolor="#6b7280", label="High-frequency: RSCU > 1"),
+        Patch(facecolor=colors[0], edgecolor="#6b7280", label="Not high-frequency"),
+    ]
+    leg = legend_ax.legend(handles=legend_handles, loc="upper left", frameon=False, fontsize=6.4, handlelength=1.0, borderaxespad=0.0)
+    for txt in leg.get_texts():
+        txt.set_color(palette["text"])
+
+    top_margin_in = COMPARATIVE_TITLE_MARGIN_IN if use_col_dend else 0.38
+    axes_top = min(0.986, max(0.850, 1.0 - (top_margin_in / effective_height)))
+    bottom_margin_in = COMPARATIVE_BOTTOM_LABEL_MARGIN_IN if n_cols >= 50 else 0.78
+    axes_bottom = min(0.240, max(0.040, bottom_margin_in / effective_height))
+
+    fig.subplots_adjust(left=0.035 if use_row_dend else 0.045,
+                        right=0.970,
+                        bottom=axes_bottom,
+                        top=axes_top)
+    return fig
+
+
+def save_comparative_optimal_codon_outputs(comparative_optimal_df, output_dir, settings, prefix="Comparative_Multi_species_Optimal_Codon_Heatmap"):
+    """Save comparative optimal-codon matrix, long table, and selected figure formats."""
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if comparative_optimal_df is None or comparative_optimal_df.empty:
+        return
+
+    safe_prefix = sanitize_filename(prefix, fallback="Comparative_Optimal_Codon_Heatmap")
+    comparative_optimal_df.to_csv(out_dir / f"{safe_prefix}.status_matrix.csv", index=False)
+    long_df = build_comparative_optimal_codon_long_table(comparative_optimal_df, table_id=settings.get("table_id", 11))
+    long_df.to_csv(out_dir / f"{safe_prefix}.long_status_table.csv", index=False)
+
+    if len(comparative_optimal_df) < 2 or not settings.get("save_figures", True):
+        return
+
+    formats = list(settings.get("formats", []) or [])
+    if not formats:
+        return
+
+    palette = get_plot_palette_by_name(settings.get("comparative_palette_name", settings.get("palette_name", "default")))
+    fig = create_comparative_optimal_codon_heatmap_figure(
+        comparative_optimal_df,
+        settings.get("fig_width", 12.0),
+        settings.get("fig_height", 7.0),
+        palette,
+        cmap_name=settings.get("comparative_optimal_cmap_name", "publication_blue"),
+        species_order=settings.get("comparative_species_order", "hierarchical_clustering"),
+        codon_order=settings.get("comparative_codon_order", "hierarchical_clustering"),
+        show_dendrograms=settings.get("comparative_show_dendrograms", True),
+        table_id=settings.get("table_id", 11),
+    )
+    try:
+        for fmt in formats:
+            fmt = str(fmt or "png").lower().strip()
+            if fmt == "tif":
+                fmt = "tiff"
+            if fmt not in {"png", "pdf", "svg", "tiff"}:
+                continue
+            ext = "tiff" if fmt == "tiff" else fmt
+            save_kwargs = {"format": fmt, "bbox_inches": "tight"}
+            if fmt in {"png", "tiff"}:
+                save_kwargs["dpi"] = EXPORT_DPI
+            fig.savefig(out_dir / f"{safe_prefix}.{ext}", **save_kwargs)
+    finally:
+        try:
+            plt.close(fig)
+        except Exception:
+            pass
 
 
 def create_correlation_figure(data, width, height, palette):
@@ -2187,6 +3205,8 @@ def create_batch_figures(data, width, height, label_top=0, palette_name="default
                          correlation_palette_name=None, correlation_cmap_name=None,
                          neutrality_palette_name=None, neutrality_cmap_name=None,
                          coa_palette_name=None, coa_cmap_name=None,
+                         composition_palette_name=None, composition_cmap_name=None,
+                         composition_color_mode="by_parameter", composition_single_color="#66b7a8",
                          rscu_stack_scheme="publication", rscu_stack_cmap_name="turbo",
                          rscu_stack_seed=None):
     """Create all figures with separate user-selectable themes for key plots."""
@@ -2218,7 +3238,17 @@ def create_batch_figures(data, width, height, label_top=0, palette_name="default
         palette_name,
         cmap_override=rscu_stack_cmap_name or "turbo"
     )
+    composition_palette = get_plot_palette_by_name(
+        composition_palette_name or palette_name,
+        cmap_override=composition_cmap_name or "Set3"
+    )
     return {
+        "CDS_Composition_Boxplot": create_composition_boxplot_figure(
+            data, width, height, composition_palette,
+            color_mode=composition_color_mode,
+            cmap_name=composition_cmap_name or "Set3",
+            single_color=composition_single_color,
+        ),
         "RSCU_Stacked_Codon_Content": create_rscu_stacked_codon_figure(
             data, width, height, rscu_stack_palette,
             color_scheme=rscu_stack_scheme,
@@ -2240,6 +3270,8 @@ def save_analysis_package(data, output_dir, prefix_name, formats, fig_width=8.0,
                           correlation_palette_name=None, correlation_cmap_name=None,
                           neutrality_palette_name=None, neutrality_cmap_name=None,
                           coa_palette_name=None, coa_cmap_name=None,
+                          composition_palette_name=None, composition_cmap_name=None,
+                          composition_color_mode="by_parameter", composition_single_color="#66b7a8",
                           rscu_stack_scheme="publication", rscu_stack_cmap_name="turbo",
                           rscu_stack_seed=None, save_figures=True):
     """Save the complete ChloroCodon output package for one analyzed file."""
@@ -2277,6 +3309,10 @@ def save_analysis_package(data, output_dir, prefix_name, formats, fig_width=8.0,
                                        neutrality_cmap_name=neutrality_cmap_name,
                                        coa_palette_name=coa_palette_name,
                                        coa_cmap_name=coa_cmap_name,
+                                       composition_palette_name=composition_palette_name,
+                                       composition_cmap_name=composition_cmap_name,
+                                       composition_color_mode=composition_color_mode,
+                                       composition_single_color=composition_single_color,
                                        rscu_stack_scheme=rscu_stack_scheme,
                                        rscu_stack_cmap_name=rscu_stack_cmap_name,
                                        rscu_stack_seed=rscu_stack_seed)
@@ -3111,6 +4147,59 @@ def _dataframe_download_button(df, filename, label):
     st.download_button(label, data=csv, file_name=filename, mime="text/csv")
 
 
+def _figure_download_bytes(fig, fmt="png"):
+    """Render a Matplotlib Figure into bytes for an immediate single-plot download."""
+    if fig is None:
+        return b""
+    fmt = str(fmt or "png").lower().strip()
+    if fmt == "tif":
+        fmt = "tiff"
+    supported = {"png", "pdf", "svg", "tiff"}
+    if fmt not in supported:
+        fmt = "png"
+    buffer = io.BytesIO()
+    save_kwargs = {"format": fmt, "bbox_inches": "tight"}
+    if fmt in {"png", "tiff"}:
+        save_kwargs["dpi"] = EXPORT_DPI
+    fig.savefig(buffer, **save_kwargs)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _figure_download_mime(fmt="png"):
+    """Return the correct MIME type for a single-plot download format."""
+    fmt = str(fmt or "png").lower().strip()
+    if fmt == "tif":
+        fmt = "tiff"
+    return {
+        "png": "image/png",
+        "pdf": "application/pdf",
+        "svg": "image/svg+xml",
+        "tiff": "image/tiff",
+    }.get(fmt, "image/png")
+
+
+def _render_single_plot_download_button(fig, plot_name, settings, key_prefix="single"):
+    """Show an immediate download button for one displayed plot."""
+    if fig is None:
+        return
+    fmt = str(settings.get("single_plot_download_format", "png") or "png").lower().strip()
+    if fmt == "tif":
+        fmt = "tiff"
+    if fmt not in {"png", "pdf", "svg", "tiff"}:
+        fmt = "png"
+    safe_plot_name = sanitize_filename(plot_name, fallback="ChloroCodon_plot")
+    file_ext = "tiff" if fmt == "tiff" else fmt
+    plot_bytes = _figure_download_bytes(fig, fmt)
+    st.download_button(
+        f"Download {plot_name.replace('_', ' ')} ({fmt.upper()})",
+        data=plot_bytes,
+        file_name=f"{safe_plot_name}.{file_ext}",
+        mime=_figure_download_mime(fmt),
+        key=f"{key_prefix}_download_{safe_plot_name}_{fmt}",
+    )
+
+
 def _format_metric_value(value, decimals=3, integer=False):
     """Format values for premium metric cards."""
     if value is None:
@@ -3216,6 +4305,10 @@ def _render_plot_gallery(data, settings, key_prefix="single"):
         neutrality_cmap_name=settings["neutrality_cmap_name"],
         coa_palette_name=settings["coa_palette_name"],
         coa_cmap_name=settings["coa_cmap_name"],
+        composition_palette_name=settings["composition_palette_name"],
+        composition_cmap_name=settings["composition_cmap_name"],
+        composition_color_mode=settings["composition_color_mode"],
+        composition_single_color=settings["composition_single_color"],
         rscu_stack_scheme=settings["rscu_stack_scheme"],
         rscu_stack_cmap_name=settings["rscu_stack_cmap_name"],
         rscu_stack_seed=settings.get("rscu_stack_seed"),
@@ -3236,6 +4329,7 @@ def _render_plot_gallery(data, settings, key_prefix="single"):
             continue
         st.markdown(f"<div class='cc-panel'><div class='cc-section-title'>{name.replace('_', ' ')}</div>", unsafe_allow_html=True)
         st.pyplot(fig, clear_figure=False, use_container_width=True)
+        _render_single_plot_download_button(fig, name, settings, key_prefix=key_prefix)
         st.markdown("</div>", unsafe_allow_html=True)
         try:
             plt.close(fig)
@@ -3268,6 +4362,10 @@ def _make_single_output_zip(data, uploaded_name, settings):
             neutrality_cmap_name=settings["neutrality_cmap_name"],
             coa_palette_name=settings["coa_palette_name"],
             coa_cmap_name=settings["coa_cmap_name"],
+            composition_palette_name=settings["composition_palette_name"],
+            composition_cmap_name=settings["composition_cmap_name"],
+            composition_color_mode=settings["composition_color_mode"],
+            composition_single_color=settings["composition_single_color"],
             rscu_stack_scheme=settings["rscu_stack_scheme"],
             rscu_stack_cmap_name=settings["rscu_stack_cmap_name"],
             rscu_stack_seed=settings.get("rscu_stack_seed"),
@@ -3295,6 +4393,7 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
         pr2_cmap_sequence = list(BATCH_SCATTER_CMAPS)
         scatter_cmap_sequence = list(BATCH_SCATTER_CMAPS)
         correlation_cmap_sequence = list(CORRELATION_CMAPS)
+        composition_cmap_sequence = list(COMPOSITION_BOXPLOT_CMAPS)
         rscu_stack_scheme_sequence = ["publication", "scientific_family", "scientific_family_soft", "amino_acid_family"]
         rscu_stack_cmap_sequence = list(RSCU_STACKED_CMAPS)
         large_batch_randomize_rscu = len(uploaded_files or []) >= 100
@@ -3305,6 +4404,7 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
             random.shuffle(pr2_cmap_sequence)
             random.shuffle(scatter_cmap_sequence)
             random.shuffle(correlation_cmap_sequence)
+            random.shuffle(composition_cmap_sequence)
             random.shuffle(rscu_stack_scheme_sequence)
             random.shuffle(rscu_stack_cmap_sequence)
         else:
@@ -3314,16 +4414,23 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
             pr2_cmap_sequence = [settings["pr2_cmap_name"]]
             scatter_cmap_sequence = [settings["neutrality_cmap_name"]]
             correlation_cmap_sequence = [settings["correlation_cmap_name"]]
+            composition_cmap_sequence = [settings["composition_cmap_name"]]
             rscu_stack_scheme_sequence = [settings["rscu_stack_scheme"]]
             rscu_stack_cmap_sequence = [settings["rscu_stack_cmap_name"]]
 
         batch_log_rows = []
+        batch_success_items = []
         combined = {
             "Batch_Genome_Stats": [],
             "Batch_RSCU": [],
             "Batch_Amino_Acid_Usage": [],
             "Batch_Stop_Codon_Usage": [],
             "Batch_Optimal_Codons": [],
+            "Batch_High_Frequency_Codons": [],
+            "Batch_High_Expression_Codons": [],
+            "Batch_Delta_RSCU": [],
+            "Batch_Optimal_Codon_Classification": [],
+            "Batch_Composition_Boxplot_Data": [],
             "Batch_QC_Log": [],
             "Batch_Duplicate_Log": [],
             "Batch_Error_Log": [],
@@ -3343,6 +4450,7 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
             enc_cmap = enc_cmap_sequence[(idx - 1) % len(enc_cmap_sequence)]
             pr2_cmap = pr2_cmap_sequence[(idx + 3) % len(pr2_cmap_sequence)]
             correlation_cmap = correlation_cmap_sequence[(idx - 1) % len(correlation_cmap_sequence)]
+            composition_cmap = composition_cmap_sequence[(idx + 4) % len(composition_cmap_sequence)]
             neutrality_cmap = scatter_cmap_sequence[(idx + 2) % len(scatter_cmap_sequence)]
             coa_cmap = scatter_cmap_sequence[(idx + 5) % len(scatter_cmap_sequence)]
             rscu_stack_scheme = rscu_stack_scheme_sequence[(idx - 1) % len(rscu_stack_scheme_sequence)]
@@ -3358,6 +4466,7 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
             if not settings.get("auto_cycle_batch_styles", True):
                 neutrality_cmap = settings["neutrality_cmap_name"]
                 coa_cmap = settings["coa_cmap_name"]
+                composition_cmap = settings["composition_cmap_name"]
                 rscu_stack_scheme = settings["rscu_stack_scheme"]
                 rscu_stack_cmap = settings["rscu_stack_cmap_name"]
 
@@ -3383,6 +4492,10 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
                     neutrality_cmap_name=neutrality_cmap if settings.get("auto_cycle_batch_styles", True) else settings["neutrality_cmap_name"],
                     coa_palette_name=theme if settings.get("auto_cycle_batch_styles", True) else settings["coa_palette_name"],
                     coa_cmap_name=coa_cmap if settings.get("auto_cycle_batch_styles", True) else settings["coa_cmap_name"],
+                    composition_palette_name=theme if settings.get("auto_cycle_batch_styles", True) else settings["composition_palette_name"],
+                    composition_cmap_name=composition_cmap if settings.get("auto_cycle_batch_styles", True) else settings["composition_cmap_name"],
+                    composition_color_mode=settings["composition_color_mode"],
+                    composition_single_color=settings["composition_single_color"],
                     rscu_stack_scheme=rscu_stack_scheme,
                     rscu_stack_cmap_name=rscu_stack_cmap,
                     rscu_stack_seed=rscu_stack_seed,
@@ -3401,6 +4514,8 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
                     "ENC_cmap": enc_cmap,
                     "PR2_cmap": pr2_cmap,
                     "Correlation_cmap": correlation_cmap,
+                    "Composition_cmap": composition_cmap,
+                    "Composition_color_mode": settings["composition_color_mode"],
                     "Neutrality_cmap": neutrality_cmap,
                     "COA_cmap": coa_cmap,
                     "RSCU_stack_scheme": rscu_stack_scheme,
@@ -3410,6 +4525,7 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
                     "Message": msg,
                 }
                 batch_log_rows.append(row)
+                batch_success_items.append({"file_name": file_name, "data": data})
 
                 metadata = {
                     "File": file_name,
@@ -3420,6 +4536,8 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
                     "ENC_cmap": enc_cmap,
                     "PR2_cmap": pr2_cmap,
                     "Correlation_cmap": correlation_cmap,
+                    "Composition_cmap": composition_cmap,
+                    "Composition_color_mode": settings["composition_color_mode"],
                     "Neutrality_cmap": neutrality_cmap,
                     "COA_cmap": coa_cmap,
                     "RSCU_stack_scheme": rscu_stack_scheme,
@@ -3432,6 +4550,11 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
                     ("Batch_Amino_Acid_Usage", "amino_acid_usage"),
                     ("Batch_Stop_Codon_Usage", "stop_codon_usage"),
                     ("Batch_Optimal_Codons", "optimal_codons"),
+                    ("Batch_High_Frequency_Codons", "high_freq_codons"),
+                    ("Batch_High_Expression_Codons", "high_expression_codons"),
+                    ("Batch_Delta_RSCU", "delta_rscu"),
+                    ("Batch_Optimal_Codon_Classification", "optimal_codon_classification"),
+                    ("Batch_Composition_Boxplot_Data", "composition_boxplot_data"),
                     ("Batch_QC_Log", "qc"),
                     ("Batch_Duplicate_Log", "duplicate_removed"),
                 ]:
@@ -3455,6 +4578,8 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
                     "ENC_cmap": enc_cmap,
                     "PR2_cmap": pr2_cmap,
                     "Correlation_cmap": correlation_cmap,
+                    "Composition_cmap": composition_cmap,
+                    "Composition_color_mode": settings["composition_color_mode"],
                     "Neutrality_cmap": neutrality_cmap,
                     "COA_cmap": coa_cmap,
                     "RSCU_stack_scheme": rscu_stack_scheme,
@@ -3470,7 +4595,40 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
 
         log_df = pd.DataFrame(batch_log_rows)
         log_df.to_csv(batch_root / "Batch_Log.csv", index=False)
+
+        comparative_rscu_df = build_comparative_rscu_matrix(
+            batch_success_items,
+            table_id=settings.get("table_id", 11),
+        )
+        comparative_optimal_df = build_comparative_optimal_codon_matrix(
+            batch_success_items,
+            table_id=settings.get("table_id", 11),
+        )
+        comparative_dir = batch_root / "02_Comparative_Analysis"
+        if comparative_rscu_df is not None and not comparative_rscu_df.empty:
+            save_comparative_rscu_outputs(
+                comparative_rscu_df,
+                comparative_dir,
+                settings,
+                prefix="Comparative_Multi_species_RSCU_Heatmap",
+            )
+        if comparative_optimal_df is not None and not comparative_optimal_df.empty:
+            save_comparative_optimal_codon_outputs(
+                comparative_optimal_df,
+                comparative_dir,
+                settings,
+                prefix="Comparative_Multi_species_Optimal_Codon_Heatmap",
+            )
+
         workbook_tables = {"Batch_Run_Log": log_df}
+        if comparative_rscu_df is not None and not comparative_rscu_df.empty:
+            workbook_tables["Comparative_RSCU_Matrix"] = comparative_rscu_df
+        if comparative_optimal_df is not None and not comparative_optimal_df.empty:
+            workbook_tables["Comparative_Optimal_Codon_Matrix"] = comparative_optimal_df
+            workbook_tables["Comparative_Optimal_Codon_Long"] = build_comparative_optimal_codon_long_table(
+                comparative_optimal_df,
+                table_id=settings.get("table_id", 11),
+            )
         for sheet, parts in combined.items():
             if parts:
                 workbook_tables[sheet] = pd.concat(parts, ignore_index=True)
@@ -3480,7 +4638,7 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
         failed = int((log_df["Status"] == "Failed").sum()) if not log_df.empty else 0
         status_box.success(f"Batch complete: {done} succeeded, {failed} failed.")
         zip_bytes = _zip_directory_to_bytes(batch_root)
-        return log_df, zip_bytes
+        return log_df, zip_bytes, comparative_rscu_df, comparative_optimal_df
 
 
 def _sidebar_settings():
@@ -3528,6 +4686,32 @@ def _sidebar_settings():
             BATCH_SCATTER_CMAPS,
             index=BATCH_SCATTER_CMAPS.index("plasma"),
             help="Controls point colouring only in the PR2 bias scatter plot.",
+        )
+
+    with st.sidebar.expander("CDS composition boxplot styling", expanded=True):
+        composition_palette_name = st.selectbox(
+            "Composition boxplot theme",
+            theme_options,
+            index=theme_options.index("default"),
+            help="Controls the background, text, grid, and axis style for the CDS composition boxplot.",
+        )
+        composition_cmap_name = st.selectbox(
+            "Composition boxplot colormap",
+            COMPOSITION_BOXPLOT_CMAPS,
+            index=COMPOSITION_BOXPLOT_CMAPS.index("Set3"),
+            help="Controls box colours for T3s, C3s, A3s, G3s, GC, GC1, GC2, and GC3.",
+        )
+        composition_color_mode = st.radio(
+            "Composition boxplot color mode",
+            ["by_parameter", "single_color"],
+            index=0,
+            format_func=lambda x: "Different colour per parameter" if x == "by_parameter" else "One selected colour for all boxes",
+            horizontal=False,
+        )
+        composition_single_color = st.color_picker(
+            "Single box colour",
+            "#66b7a8",
+            help="Used only when the single-colour mode is selected.",
         )
 
     with st.sidebar.expander("RSCU heatmap styling", expanded=True):
@@ -3588,7 +4772,63 @@ def _sidebar_settings():
             index=BATCH_SCATTER_CMAPS.index("turbo"),
         )
 
+    with st.sidebar.expander("Comparative analysis heatmap styling", expanded=True):
+        comparative_palette_name = st.selectbox(
+            "Comparative heatmap theme",
+            theme_options,
+            index=theme_options.index("default"),
+            help="Controls background, text, dendrogram, and colorbar styling for batch-level comparative heatmaps.",
+        )
+        comparative_rscu_cmap_name = st.selectbox(
+            "Comparative RSCU heatmap colormap",
+            COMPARATIVE_RSCU_CMAPS,
+            index=COMPARATIVE_RSCU_CMAPS.index("green_pink_publication"),
+            format_func=lambda x: "Green → white → pink (publication)" if x == "green_pink_publication" else x,
+            help="Controls the colour gradient for the species × codon RSCU heatmap.",
+        )
+        comparative_optimal_cmap_name = st.selectbox(
+            "Comparative optimal codon heatmap colour set",
+            COMPARATIVE_OPTIMAL_CMAPS,
+            index=COMPARATIVE_OPTIMAL_CMAPS.index("publication_blue"),
+            format_func=lambda x: {
+                "publication_blue": "Publication blue: grey / white / light blue",
+                "blue_green": "Blue-green: grey / white / mint",
+                "purple_blue": "Purple-blue: grey / white / lavender",
+            }.get(x, x),
+            help="Discrete colours for the species × codon optimal-codon status heatmap.",
+        )
+        comparative_species_order = st.selectbox(
+            "Comparative species order",
+            COMPARATIVE_SPECIES_ORDER_OPTIONS,
+            index=COMPARATIVE_SPECIES_ORDER_OPTIONS.index("hierarchical_clustering"),
+            format_func=lambda x: {
+                "hierarchical_clustering": "Hierarchical clustering",
+                "input_order": "Input/upload order",
+                "alphabetical": "Alphabetical species name",
+            }.get(x, x),
+        )
+        comparative_codon_order = st.selectbox(
+            "Comparative codon order",
+            COMPARATIVE_CODON_ORDER_OPTIONS,
+            index=COMPARATIVE_CODON_ORDER_OPTIONS.index("hierarchical_clustering"),
+            format_func=lambda x: {
+                "hierarchical_clustering": "Hierarchical clustering",
+                "standard_order": "Standard 64-codon order",
+            }.get(x, x),
+        )
+        comparative_show_dendrograms = st.checkbox(
+            "Show comparative dendrograms",
+            value=True,
+            help="When hierarchical ordering is selected, show row/column dendrograms around the heatmap.",
+        )
+
     with st.sidebar.expander("Export settings", expanded=True):
+        single_plot_download_format = st.selectbox(
+            "Single plot quick-download format",
+            ["png", "pdf", "svg", "tiff"],
+            index=0,
+            help="Format used by the individual download button shown under each previewed plot.",
+        )
         formats = st.multiselect("Figure export formats", ["png", "pdf", "svg", "tiff"], default=["png"])
         save_figures = st.checkbox("Save figures in output package", value=True)
         auto_cycle_batch_styles = st.checkbox("Batch mode: auto-cycle themes/colormaps", value=True)
@@ -3603,6 +4843,16 @@ def _sidebar_settings():
         "cmap_name": cmap_name,
         "enc_cmap_name": enc_cmap_name,
         "pr2_cmap_name": pr2_cmap_name,
+        "composition_palette_name": composition_palette_name,
+        "composition_cmap_name": composition_cmap_name,
+        "composition_color_mode": composition_color_mode,
+        "composition_single_color": composition_single_color,
+        "comparative_palette_name": comparative_palette_name,
+        "comparative_rscu_cmap_name": comparative_rscu_cmap_name,
+        "comparative_optimal_cmap_name": comparative_optimal_cmap_name,
+        "comparative_species_order": comparative_species_order,
+        "comparative_codon_order": comparative_codon_order,
+        "comparative_show_dendrograms": bool(comparative_show_dendrograms),
         "rscu_stack_scheme": rscu_stack_scheme,
         "rscu_stack_cmap_name": rscu_stack_cmap_name,
         "rscu_stack_seed": rscu_stack_seed,
@@ -3612,6 +4862,7 @@ def _sidebar_settings():
         "neutrality_cmap_name": neutrality_cmap_name,
         "coa_palette_name": coa_palette_name,
         "coa_cmap_name": coa_cmap_name,
+        "single_plot_download_format": single_plot_download_format,
         "formats": formats,
         "save_figures": bool(save_figures),
         "auto_cycle_batch_styles": bool(auto_cycle_batch_styles),
@@ -3645,11 +4896,18 @@ def _single_result_signature(uploaded_file, settings):
 
 
 def _batch_result_signature(uploaded_files, settings):
-    """Full batch-mode signature: uploaded files + analysis/export settings."""
+    """Batch analysis signature: uploaded files + biological analysis settings only.
+
+    Plot styling, figure size, colormap, dendrogram, and export-format settings
+    must not invalidate stored batch results. Streamlit reruns the script whenever
+    a sidebar widget changes; keeping this signature limited to true analysis
+    inputs lets comparative plots update live from the cached comparative matrix
+    instead of forcing users to run the whole batch again.
+    """
     files_sig = _uploaded_files_signature(uploaded_files)
     if files_sig is None:
         return None
-    return f"{files_sig}|{_analysis_settings_signature(settings)}|{_export_settings_signature(settings)}|auto_cycle_batch_styles={bool(settings.get('auto_cycle_batch_styles', True))}"
+    return f"{files_sig}|{_analysis_settings_signature(settings)}"
 
 
 def _export_settings_signature(settings):
@@ -3662,6 +4920,16 @@ def _export_settings_signature(settings):
         "cmap_name",
         "enc_cmap_name",
         "pr2_cmap_name",
+        "composition_palette_name",
+        "composition_cmap_name",
+        "composition_color_mode",
+        "composition_single_color",
+        "comparative_palette_name",
+        "comparative_rscu_cmap_name",
+        "comparative_optimal_cmap_name",
+        "comparative_species_order",
+        "comparative_codon_order",
+        "comparative_show_dendrograms",
         "rscu_stack_scheme",
         "rscu_stack_cmap_name",
         "correlation_palette_name",
@@ -3705,8 +4973,11 @@ def _clear_batch_result_state():
     for key in [
         "batch_result_log_df",
         "batch_result_zip_bytes",
+        "batch_comparative_rscu_df",
+        "batch_comparative_optimal_df",
         "batch_result_signature",
         "batch_result_error",
+        "batch_result_section",
     ]:
         st.session_state.pop(key, None)
 
@@ -3842,6 +5113,131 @@ def _render_single_mode(settings):
         )
 
 
+
+def _render_comparative_analysis_dashboard(comparative_rscu_df, comparative_optimal_df, settings):
+    """Render batch-level comparative plots that require two or more GenBank files."""
+    st.markdown(
+        """
+        <div class="cc-panel">
+            <div class="cc-section-title">Comparative analysis dashboard</div>
+            <div class="cc-muted">Batch-level plots generated from all successfully analyzed GenBank files. These figures are previewed here and also included in the batch ZIP package.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    has_rscu = comparative_rscu_df is not None and not comparative_rscu_df.empty
+    has_optimal = comparative_optimal_df is not None and not comparative_optimal_df.empty
+    if not has_rscu and not has_optimal:
+        st.info("No comparative matrices are available. Run batch analysis with at least two valid GenBank files.")
+        return
+
+    n_species = len(comparative_rscu_df) if has_rscu else len(comparative_optimal_df)
+    n_codons = len([c for c in CODON_ORDER if has_rscu and c in comparative_rscu_df.columns])
+    n_optimal_codons = len([c for c in _sense_codon_order_for_table(settings.get("table_id", 11)) if has_optimal and c in comparative_optimal_df.columns])
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        _metric_card("Species/files", _format_metric_value(n_species, integer=True), "successful batch analyses")
+    with c2:
+        _metric_card("RSCU codons", _format_metric_value(n_codons, integer=True), "all codons")
+    with c3:
+        _metric_card("Optimal codon columns", _format_metric_value(n_optimal_codons, integer=True), "sense codons")
+
+    if n_species < 2:
+        st.warning("Comparative heatmap preview requires at least two successfully analyzed GenBank files.")
+        if has_rscu:
+            _dataframe_download_button(
+                comparative_rscu_df,
+                "Comparative_Multi_species_RSCU_Heatmap.matrix.csv",
+                "Download comparative RSCU matrix CSV",
+            )
+        if has_optimal:
+            _dataframe_download_button(
+                comparative_optimal_df,
+                "Comparative_Multi_species_Optimal_Codon_Heatmap.status_matrix.csv",
+                "Download comparative optimal-codon status matrix CSV",
+            )
+        return
+
+    palette = get_plot_palette_by_name(settings.get("comparative_palette_name", settings.get("palette_name", "default")))
+
+    if has_rscu:
+        fig = create_comparative_rscu_heatmap_figure(
+            comparative_rscu_df,
+            settings.get("fig_width", 12.0),
+            settings.get("fig_height", 7.0),
+            palette,
+            cmap_name=settings.get("comparative_rscu_cmap_name", "green_pink_publication"),
+            species_order=settings.get("comparative_species_order", "hierarchical_clustering"),
+            codon_order=settings.get("comparative_codon_order", "hierarchical_clustering"),
+            show_dendrograms=settings.get("comparative_show_dendrograms", True),
+        )
+
+        st.markdown(
+            "<div class='cc-panel'><div class='cc-section-title'>Comparative Multi-species RSCU Heatmap</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption("Rows represent species/files, columns represent the 64 codons, and colour intensity represents genome-level RSCU value from accepted cp CDSs.")
+        st.pyplot(fig, clear_figure=False, use_container_width=True)
+        _render_single_plot_download_button(fig, "Comparative_Multi_species_RSCU_Heatmap", settings, key_prefix="batch_comparative")
+        _dataframe_download_button(
+            comparative_rscu_df,
+            "Comparative_Multi_species_RSCU_Heatmap.matrix.csv",
+            "Download comparative RSCU matrix CSV",
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        try:
+            plt.close(fig)
+        except Exception:
+            pass
+
+    if has_optimal:
+        fig_opt = create_comparative_optimal_codon_heatmap_figure(
+            comparative_optimal_df,
+            settings.get("fig_width", 12.0),
+            settings.get("fig_height", 7.0),
+            palette,
+            cmap_name=settings.get("comparative_optimal_cmap_name", "publication_blue"),
+            species_order=settings.get("comparative_species_order", "hierarchical_clustering"),
+            codon_order=settings.get("comparative_codon_order", "hierarchical_clustering"),
+            show_dendrograms=settings.get("comparative_show_dendrograms", True),
+            table_id=settings.get("table_id", 11),
+        )
+
+        st.markdown(
+            "<div class='cc-panel'><div class='cc-section-title'>Comparative Multi-species Optimal Codon Heatmap</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption("Rows represent species/files, columns represent sense codons, and cell colour represents optimal-codon status: grey = not high-frequency, white = RSCU > 1, light blue = RSCU > 1 and ΔRSCU ≥ 0.08.")
+        st.pyplot(fig_opt, clear_figure=False, use_container_width=True)
+        _render_single_plot_download_button(fig_opt, "Comparative_Multi_species_Optimal_Codon_Heatmap", settings, key_prefix="batch_comparative_optimal")
+        _dataframe_download_button(
+            comparative_optimal_df,
+            "Comparative_Multi_species_Optimal_Codon_Heatmap.status_matrix.csv",
+            "Download comparative optimal-codon status matrix CSV",
+        )
+        optimal_long_df = build_comparative_optimal_codon_long_table(comparative_optimal_df, table_id=settings.get("table_id", 11))
+        _dataframe_download_button(
+            optimal_long_df,
+            "Comparative_Multi_species_Optimal_Codon_Heatmap.long_status_table.csv",
+            "Download comparative optimal-codon long table CSV",
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        try:
+            plt.close(fig_opt)
+        except Exception:
+            pass
+
+    if has_rscu:
+        with st.expander("Preview comparative RSCU matrix", expanded=False):
+            _display_dataframe_one_based(comparative_rscu_df, use_container_width=True, height=360)
+    if has_optimal:
+        with st.expander("Preview comparative optimal-codon status matrix", expanded=False):
+            _display_dataframe_one_based(comparative_optimal_df, use_container_width=True, height=360)
+
+
 def _render_batch_mode(settings):
     st.markdown(
         """
@@ -3890,9 +5286,11 @@ def _render_batch_mode(settings):
             st.warning("No figure format is selected. Tables, text files, and Excel outputs will still be saved.")
 
         try:
-            log_df, zip_bytes = _run_batch_analysis_streamlit(uploaded_files, settings)
+            log_df, zip_bytes, comparative_rscu_df, comparative_optimal_df = _run_batch_analysis_streamlit(uploaded_files, settings)
             st.session_state["batch_result_log_df"] = log_df
             st.session_state["batch_result_zip_bytes"] = zip_bytes
+            st.session_state["batch_comparative_rscu_df"] = comparative_rscu_df
+            st.session_state["batch_comparative_optimal_df"] = comparative_optimal_df
             st.session_state["batch_result_signature"] = current_signature
             st.session_state["batch_result_error"] = None
         except Exception as exc:
@@ -3905,20 +5303,48 @@ def _render_batch_mode(settings):
 
     log_df = st.session_state.get("batch_result_log_df")
     zip_bytes = st.session_state.get("batch_result_zip_bytes")
+    comparative_rscu_df = st.session_state.get("batch_comparative_rscu_df")
+    comparative_optimal_df = st.session_state.get("batch_comparative_optimal_df")
 
     if log_df is None or zip_bytes is None:
         st.info("Files selected. Click **Run batch analysis** to generate the batch package.")
         return
 
-    st.markdown("<div class='cc-panel'><div class='cc-section-title'>Batch run log</div>", unsafe_allow_html=True)
-    _display_dataframe_one_based(log_df, use_container_width=True, height=360)
-    st.markdown("</div>", unsafe_allow_html=True)
-    st.download_button(
-        "Download complete batch output ZIP",
-        data=zip_bytes,
-        file_name=f"ChloroCodon_Batch_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-        mime="application/zip",
+    section_options = ["Run log", "Comparative plots", "Download package"]
+    if st.session_state.get("batch_result_section") not in section_options:
+        st.session_state["batch_result_section"] = "Run log"
+
+    selected_section = st.radio(
+        "Batch result section",
+        section_options,
+        horizontal=True,
+        key="batch_result_section",
     )
+
+    if selected_section == "Run log":
+        st.markdown("<div class='cc-panel'><div class='cc-section-title'>Batch run log</div>", unsafe_allow_html=True)
+        _display_dataframe_one_based(log_df, use_container_width=True, height=360)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    elif selected_section == "Comparative plots":
+        _render_comparative_analysis_dashboard(comparative_rscu_df, comparative_optimal_df, settings)
+
+    elif selected_section == "Download package":
+        st.markdown(
+            """
+            <div class="cc-panel">
+                <div class="cc-section-title">Complete batch output package</div>
+                <div class="cc-muted">The ZIP contains per-species result folders, the combined batch workbook, the batch log, and comparative RSCU/optimal-codon outputs when two or more files are successfully analyzed.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.download_button(
+            "Download complete batch output ZIP",
+            data=zip_bytes,
+            file_name=f"ChloroCodon_Batch_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+            mime="application/zip",
+        )
 
 
 def main():
