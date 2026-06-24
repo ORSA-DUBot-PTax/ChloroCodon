@@ -51,9 +51,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.colors import LinearSegmentedColormap, ListedColormap, BoundaryNorm
-from matplotlib.patches import Patch
+from matplotlib.patches import Patch, Rectangle
 from mpl_toolkits.axes_grid1 import make_axes_locatable
-from scipy.stats import linregress
+from scipy.stats import linregress, pearsonr, gaussian_kde
 from scipy.cluster.hierarchy import linkage, dendrogram
 from scipy.spatial.distance import pdist
 from sklearn.decomposition import PCA
@@ -1405,6 +1405,56 @@ BATCH_SCATTER_CMAPS = [
     "tab20",
 ]
 
+COMPARATIVE_CORRELATION_PARAMETERS = ["GC1", "GC2", "GC3", "GC_all", "GC3s", "CAI", "ENC", "L_aa"]
+COMPARATIVE_CORRELATION_SPECIES_CMAPS = [
+    "tab10",
+    "tab20",
+    "Set1",
+    "Set2",
+    "Set3",
+    "Accent",
+    "Dark2",
+    "Paired",
+    "Pastel1",
+    "Pastel2",
+    "rainbow",
+    "nipy_spectral",
+    "gist_rainbow",
+]
+
+# ENC ratio frequency-distribution bins for comparative stacked-bar plots.
+# ENC_ratio = (ENC_exp - ENC_obs) / ENC_exp
+# The central five classes match the published style commonly used in cp codon-bias papers.
+# Extreme bins are included only when needed so no genes are silently dropped.
+ENC_RATIO_BIN_DEFINITIONS = [
+    ("le_-0.20", "≤ -0.20", -np.inf, -0.20, "#f4fbf1"),
+    ("-0.20_-0.10", "(-0.20, -0.10]", -0.20, -0.10, "#dcefd7"),
+    ("-0.10_0.00", "(-0.10, 0.00]", -0.10, 0.00, "#98dc78"),
+    ("0.00_0.10", "(0.00, 0.10]", 0.00, 0.10, "#52c98b"),
+    ("0.10_0.20", "(0.10, 0.20]", 0.10, 0.20, "#10b7a1"),
+    ("0.20_0.30", "(0.20, 0.30]", 0.20, 0.30, "#089ba0"),
+    ("gt_0.30", "> 0.30", 0.30, np.inf, "#056b86"),
+]
+ENC_RATIO_STACK_ORDER = ["gt_0.30", "0.20_0.30", "0.10_0.20", "0.00_0.10", "-0.10_0.00", "-0.20_-0.10", "le_-0.20"]
+ENC_RATIO_LEGEND_ORDER = ["le_-0.20", "-0.20_-0.10", "-0.10_0.00", "0.00_0.10", "0.10_0.20", "0.20_0.30", "gt_0.30"]
+
+ENC_RATIO_COLOR_PALETTE_OPTIONS = [
+    "publication_green",
+    "green_teal_dark",
+    "blue_purple",
+    "orange_red",
+    "pink_teal",
+    "viridis",
+    "plasma",
+    "magma",
+    "cividis",
+    "turbo",
+    "Set2",
+    "Paired",
+    "Pastel1",
+    "tab10",
+]
+
 
 def sanitize_filename(name, fallback="ChloroCodon_Result"):
     """Return a filesystem-safe file/folder name while preserving readability."""
@@ -2282,6 +2332,987 @@ def build_comparative_optimal_codon_long_table(comparative_optimal_df, table_id=
     return pd.DataFrame(rows)
 
 
+def _infer_species_name_from_batch_item(item, fallback_prefix="Species"):
+    """Infer a readable species label from one successful batch-analysis item."""
+    data = item.get("data", {}) if isinstance(item, dict) else {}
+    records = data.get("records", []) if isinstance(data, dict) else []
+    organism = ""
+    for rec in records:
+        organism = str(rec.get("organism", "") or "").strip()
+        if organism:
+            break
+    if organism:
+        return organism
+    input_file = item.get("file_name") if isinstance(item, dict) else ""
+    if input_file:
+        return Path(str(input_file)).stem
+    return f"{fallback_prefix}"
+
+
+def abbreviate_species_name_for_axis(species_name):
+    """Return compact binomial labels such as 'C. elegans' for crowded axes."""
+    name = str(species_name or "").strip()
+    if not name:
+        return ""
+    duplicate_suffix = ""
+    duplicate_match = re.search(r"\s+(\(\d+\))$", name)
+    if duplicate_match:
+        duplicate_suffix = " " + duplicate_match.group(1)
+        name = name[:duplicate_match.start()].strip()
+
+    # Remove common file-style separators while preserving species words.
+    clean = re.sub(r"[_]+", " ", name)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    parts = clean.split()
+    if len(parts) >= 2 and len(parts[0]) > 1:
+        return f"{parts[0][0]}. {parts[1]}{duplicate_suffix}"
+    return f"{clean}{duplicate_suffix}"
+
+
+def build_multispecies_correlation_dataset(batch_success_items, table_id=11):
+    """Build a combined gene-level dataset for multi-species comparative correlation plots.
+
+    Each row represents one accepted CDS/gene from one input GenBank file.
+    The comparative correlation plot uses per-gene nucleotide composition and
+    codon-utilization indices:
+
+    GC1, GC2, GC3, GC_all, GC3s, CAI, ENC, and L_aa.
+
+    Notes
+    -----
+    - GC1, GC2, GC3, and GC_all are stored as fractions in the per-gene metrics.
+    - GC3s may be stored as a percentage, so it is normalized to a fraction
+      before plotting and correlation testing.
+    - L_aa uses the accepted CDS codon count, which is equivalent to amino-acid
+      length after terminal stop-codon removal.
+    """
+    output_columns = [
+        "Species", "Species_order", "Input_file", "label", "gene",
+        "GC1", "GC2", "GC3", "GC_all", "GC3s", "CAI", "ENC", "L_aa",
+    ]
+    rows = []
+    if not batch_success_items:
+        return pd.DataFrame(columns=output_columns)
+
+    used_names = {}
+    for species_order, item in enumerate(batch_success_items, start=1):
+        data = item.get("data", {}) if isinstance(item, dict) else {}
+        file_name = str(item.get("file_name", "") or "")
+        base_species = _infer_species_name_from_batch_item(item, fallback_prefix=f"Species_{species_order}")
+        count = used_names.get(base_species, 0) + 1
+        used_names[base_species] = count
+        species_name = base_species if count == 1 else f"{base_species} ({count})"
+
+        metric_rows = []
+        for m in data.get("metrics_list", []) or []:
+            gc3s_value = m.get("GC3s", np.nan)
+            if pd.notna(gc3s_value):
+                try:
+                    gc3s_value = float(gc3s_value)
+                    if abs(gc3s_value) > 1.0:
+                        gc3s_value = gc3s_value / 100.0
+                except Exception:
+                    gc3s_value = np.nan
+
+            metric_rows.append({
+                "Species": species_name,
+                "Species_order": species_order,
+                "Input_file": file_name,
+                "label": m.get("label", ""),
+                "gene": m.get("gene", ""),
+                "GC1": m.get("GC1", np.nan),
+                "GC2": m.get("GC2", np.nan),
+                "GC3": m.get("GC3", np.nan),
+                "GC_all": m.get("GC", np.nan),
+                "GC3s": gc3s_value,
+                "CAI": m.get("CAI", np.nan),
+                "ENC": m.get("ENC", np.nan),
+                "L_aa": m.get("total_codons", m.get("length_codons", np.nan)),
+            })
+
+        if metric_rows:
+            rows.append(pd.DataFrame(metric_rows))
+
+    if not rows:
+        return pd.DataFrame(columns=output_columns)
+
+    out = pd.concat(rows, ignore_index=True)
+    for col in ["GC1", "GC2", "GC3", "GC_all", "GC3s", "CAI", "ENC", "L_aa"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    return out[output_columns]
+
+def _correlation_significance_stars(p_value):
+    """Return publication-style significance stars from a p-value."""
+    try:
+        if pd.isna(p_value):
+            return ""
+        p = float(p_value)
+    except Exception:
+        return ""
+    if p < 0.001:
+        return "***"
+    if p < 0.01:
+        return "**"
+    if p < 0.05:
+        return "*"
+    return ""
+
+
+def _safe_pearson_correlation(x, y):
+    """Robust Pearson correlation helper returning (r, p, n)."""
+    x = pd.to_numeric(pd.Series(x), errors="coerce")
+    y = pd.to_numeric(pd.Series(y), errors="coerce")
+    mask = (~x.isna()) & (~y.isna())
+    n = int(mask.sum())
+    if n < 3:
+        return np.nan, np.nan, n
+    xv = x[mask].to_numpy(dtype=float)
+    yv = y[mask].to_numpy(dtype=float)
+    if np.nanstd(xv) == 0 or np.nanstd(yv) == 0:
+        return np.nan, np.nan, n
+    try:
+        r, p = pearsonr(xv, yv)
+        return float(r), float(p), n
+    except Exception:
+        return np.nan, np.nan, n
+
+
+def _format_correlation_text(r_value, p_value):
+    """Format correlation text with significance stars."""
+    if pd.isna(r_value):
+        return "NA"
+    return f"{float(r_value):.3f}{_correlation_significance_stars(p_value)}"
+
+
+def split_multispecies_correlation_chunks(comparative_corr_df, species_per_plot=10):
+    """Split a combined gene-level comparative-correlation table into species chunks."""
+    if comparative_corr_df is None or comparative_corr_df.empty:
+        return []
+
+    species_per_plot = max(int(species_per_plot or 10), 1)
+    species_df = comparative_corr_df[["Species", "Species_order"]].drop_duplicates().copy()
+    species_df = species_df.sort_values(["Species_order", "Species"], kind="stable").reset_index(drop=True)
+    chunks = []
+    total_species = len(species_df)
+    for start in range(0, total_species, species_per_plot):
+        sub_species_df = species_df.iloc[start:start + species_per_plot].copy().reset_index(drop=True)
+        species_names = sub_species_df["Species"].tolist()
+        chunk_df = comparative_corr_df[comparative_corr_df["Species"].isin(species_names)].copy()
+        code_letters = [chr(ord("A") + i) for i in range(len(species_names))]
+        code_map = {name: code_letters[i] for i, name in enumerate(species_names)}
+        plot_index = (start // species_per_plot) + 1
+        chunk_df["Species_code"] = chunk_df["Species"].map(code_map)
+        chunk_df["Species_plot_order"] = chunk_df["Species"].map({name: i + 1 for i, name in enumerate(species_names)})
+        chunk_df = chunk_df.sort_values(["Species_plot_order", "Species", "label"], kind="stable").reset_index(drop=True)
+        key_df = pd.DataFrame({
+            "Species_code": code_letters,
+            "Species": species_names,
+            "Input_block_start": start + 1,
+            "Input_block_end": min(start + len(species_names), total_species),
+            "Plot_index": plot_index,
+        })
+        chunks.append({
+            "plot_index": plot_index,
+            "total_plots": int(np.ceil(total_species / species_per_plot)),
+            "start_species_index": start + 1,
+            "end_species_index": min(start + len(species_names), total_species),
+            "species_names": species_names,
+            "code_map": code_map,
+            "species_key_df": key_df,
+            "df": chunk_df,
+        })
+    return chunks
+
+
+def create_multispecies_correlation_figure(
+    comparative_corr_chunk_df,
+    width=16.0,
+    height=13.0,
+    palette=None,
+    species_cmap_name="tab10",
+    parameters=None,
+    plot_index=1,
+    total_plots=1,
+    start_species_index=1,
+    end_species_index=None,
+):
+    """Create a publication-style multi-species correlation matrix figure.
+
+    Layout rules
+    ------------
+    - Lower triangle: scatter plots coloured by species.
+    - Diagonal: per-species density curves.
+    - Upper triangle: overall and per-species Pearson correlations with
+      significance stars.
+    - Numeric tick values are shown only on the left side and bottom side.
+    - Parameter names are shown only in top strips and right strips, matching
+      a GGally/ggpairs-style publication layout.
+    """
+    if comparative_corr_chunk_df is None or comparative_corr_chunk_df.empty:
+        fig, ax = plt.subplots(figsize=(max(float(width), 8.0), max(float(height), 5.0)))
+        ax.text(0.5, 0.5, "No comparative correlation data available", ha="center", va="center", fontsize=12)
+        ax.axis("off")
+        return fig
+
+    palette = palette or get_plot_palette_by_name("default")
+    params = [p for p in (parameters or COMPARATIVE_CORRELATION_PARAMETERS) if p in comparative_corr_chunk_df.columns]
+    n = len(params)
+    if n == 0:
+        fig, ax = plt.subplots(figsize=(max(float(width), 8.0), max(float(height), 5.0)))
+        ax.text(0.5, 0.5, "No valid parameters found for correlation analysis", ha="center", va="center", fontsize=12)
+        ax.axis("off")
+        return fig
+
+    width = max(float(width), max(16.0, n * 2.35))
+    height = max(float(height), max(13.0, n * 2.05))
+
+    fig, axes = plt.subplots(n, n, figsize=(width, height), squeeze=False)
+    fig.patch.set_facecolor(palette["figure_bg"])
+
+    species_df = comparative_corr_chunk_df[["Species", "Species_code", "Species_plot_order"]].drop_duplicates().copy()
+    species_df = species_df.sort_values(["Species_plot_order", "Species"], kind="stable")
+    species_names = species_df["Species"].tolist()
+    code_map = dict(zip(species_df["Species"], species_df["Species_code"]))
+    species_colors = dict(zip(species_names, _sample_cmap_colors(species_cmap_name, len(species_names), soft=False)))
+
+    axes_bg = _mix_color_with_white(palette["axes_bg"], amount=0.10)
+    grid_color = palette.get("grid", "#d9d9d9")
+    text_color = palette.get("text", "#222222")
+    border_color = _mix_color_with_black(grid_color, amount=0.08)
+    strip_bg = "#d9d9d9"
+    strip_text = "#111111"
+
+    limits = {}
+    for var in params:
+        values = pd.to_numeric(comparative_corr_chunk_df[var], errors="coerce").dropna().to_numpy(dtype=float)
+        if len(values) == 0:
+            limits[var] = (0.0, 1.0)
+            continue
+        vmin, vmax = float(np.nanmin(values)), float(np.nanmax(values))
+        if not np.isfinite(vmin) or not np.isfinite(vmax):
+            limits[var] = (0.0, 1.0)
+            continue
+        if vmin == vmax:
+            pad = abs(vmin) * 0.05 if vmin != 0 else 1.0
+        else:
+            pad = (vmax - vmin) * 0.06
+        limits[var] = (vmin - pad, vmax + pad)
+
+    def _format_ticklabels(ax):
+        """Keep tick labels compact so they do not enter neighbouring panels."""
+        ax.tick_params(axis="both", which="major", labelsize=6.7, colors=text_color, pad=1.5, length=2.5)
+        ax.tick_params(axis="both", which="minor", length=0)
+        for tick in ax.get_xticklabels() + ax.get_yticklabels():
+            tick.set_clip_on(False)
+
+    def _set_outer_ticks(ax, row, col, is_text_panel=False):
+        """Show numeric tick values only at the left and bottom outer edges."""
+        if is_text_panel:
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.tick_params(bottom=False, left=False, labelbottom=False, labelleft=False)
+            return
+
+        show_bottom = row == n - 1
+        show_left = col == 0
+
+        ax.tick_params(
+            axis="x",
+            bottom=show_bottom,
+            labelbottom=show_bottom,
+            top=False,
+            labeltop=False,
+        )
+        ax.tick_params(
+            axis="y",
+            left=show_left,
+            labelleft=show_left,
+            right=False,
+            labelright=False,
+        )
+
+        if not show_bottom:
+            ax.set_xticklabels([])
+        if not show_left:
+            ax.set_yticklabels([])
+
+    for i, yvar in enumerate(params):
+        for j, xvar in enumerate(params):
+            ax = axes[i, j]
+            ax.set_facecolor(axes_bg)
+
+            for spine in ax.spines.values():
+                spine.set_color(border_color)
+                spine.set_linewidth(0.7)
+
+            ax.grid(True, color=grid_color, linewidth=0.55, alpha=0.70, zorder=0)
+            _format_ticklabels(ax)
+
+            if i == j:
+                # Diagonal density panel
+                ax.set_xlim(*limits[xvar])
+                ymax = 0.0
+
+                for species in species_names:
+                    sub = comparative_corr_chunk_df.loc[comparative_corr_chunk_df["Species"] == species, xvar]
+                    vals = pd.to_numeric(sub, errors="coerce").dropna().to_numpy(dtype=float)
+                    if len(vals) == 0:
+                        continue
+
+                    color = species_colors[species]
+                    if len(vals) >= 2 and np.nanstd(vals) > 0:
+                        xs = np.linspace(limits[xvar][0], limits[xvar][1], 220)
+                        try:
+                            ys = gaussian_kde(vals)(xs)
+                            ymax = max(ymax, float(np.nanmax(ys)))
+                            ax.fill_between(xs, 0, ys, color=color, alpha=0.22, zorder=1)
+                            ax.plot(xs, ys, color=_mix_color_with_black(color, amount=0.10), linewidth=1.15, zorder=2)
+                        except Exception:
+                            ax.hist(vals, bins=14, density=True, alpha=0.22, color=color, histtype="stepfilled", zorder=1)
+                    else:
+                        ax.axvline(float(vals[0]), color=color, linewidth=1.3, alpha=0.9, zorder=2)
+
+                if ymax > 0:
+                    ax.set_ylim(0, ymax * 1.10)
+
+                _set_outer_ticks(ax, i, j, is_text_panel=False)
+
+            elif i > j:
+                # Lower triangle scatter panel
+                ax.set_xlim(*limits[xvar])
+                ax.set_ylim(*limits[yvar])
+
+                for species in species_names:
+                    sub = comparative_corr_chunk_df.loc[comparative_corr_chunk_df["Species"] == species, [xvar, yvar]].copy()
+                    sub[xvar] = pd.to_numeric(sub[xvar], errors="coerce")
+                    sub[yvar] = pd.to_numeric(sub[yvar], errors="coerce")
+                    sub = sub.dropna()
+                    if sub.empty:
+                        continue
+
+                    ax.scatter(
+                        sub[xvar],
+                        sub[yvar],
+                        s=13,
+                        alpha=0.86,
+                        color=species_colors[species],
+                        edgecolors="#ffffff",
+                        linewidths=0.18,
+                        zorder=3,
+                    )
+
+                _set_outer_ticks(ax, i, j, is_text_panel=False)
+
+            else:
+                # Upper triangle correlation-text panel
+                ax.grid(False)
+                ax.set_xlim(0, 1)
+                ax.set_ylim(0, 1)
+                _set_outer_ticks(ax, i, j, is_text_panel=True)
+
+                overall_r, overall_p, _ = _safe_pearson_correlation(comparative_corr_chunk_df[xvar], comparative_corr_chunk_df[yvar])
+                lines = [(f"Corr: {_format_correlation_text(overall_r, overall_p)}", text_color)]
+
+                for species in species_names:
+                    sub = comparative_corr_chunk_df.loc[comparative_corr_chunk_df["Species"] == species]
+                    r_val, p_val, _ = _safe_pearson_correlation(sub[xvar], sub[yvar])
+                    lines.append((f"{code_map[species]}: {_format_correlation_text(r_val, p_val)}", species_colors[species]))
+
+                # For 10 species, 11 text rows fit safely inside the panel.
+                font_size = 7.0 if len(lines) <= 11 else max(5.4, 7.0 - (len(lines) - 11) * 0.18)
+                y_positions = np.linspace(0.86, 0.10, len(lines))
+                for (line_text, line_color), ypos in zip(lines, y_positions):
+                    ax.text(
+                        0.50,
+                        ypos,
+                        line_text,
+                        ha="center",
+                        va="center",
+                        fontsize=font_size,
+                        color=line_color,
+                        fontweight="medium",
+                        clip_on=True,
+                    )
+
+            # Remove normal axis labels. Parameter names are shown in strip labels.
+            ax.set_xlabel("")
+            ax.set_ylabel("")
+
+            # Top grey strip labels
+            if i == 0:
+                top_strip = Rectangle(
+                    (0.0, 1.015),
+                    1.0,
+                    0.115,
+                    transform=ax.transAxes,
+                    facecolor=strip_bg,
+                    edgecolor=border_color,
+                    linewidth=0.5,
+                    clip_on=False,
+                    zorder=8,
+                )
+                ax.add_patch(top_strip)
+                ax.text(
+                    0.5,
+                    1.072,
+                    xvar,
+                    transform=ax.transAxes,
+                    ha="center",
+                    va="center",
+                    fontsize=8.2,
+                    color=strip_text,
+                    fontweight="bold",
+                    clip_on=False,
+                    zorder=9,
+                )
+
+            # Right grey strip labels
+            if j == n - 1:
+                right_strip = Rectangle(
+                    (1.015, 0.0),
+                    0.105,
+                    1.0,
+                    transform=ax.transAxes,
+                    facecolor=strip_bg,
+                    edgecolor=border_color,
+                    linewidth=0.5,
+                    clip_on=False,
+                    zorder=8,
+                )
+                ax.add_patch(right_strip)
+                ax.text(
+                    1.067,
+                    0.5,
+                    yvar,
+                    transform=ax.transAxes,
+                    rotation=-90,
+                    ha="center",
+                    va="center",
+                    fontsize=8.2,
+                    color=strip_text,
+                    fontweight="bold",
+                    clip_on=False,
+                    zorder=9,
+                )
+
+    title = "Comparative correlation analysis of GC composition and codon utilization indices"
+    subtitle = f"Species block {plot_index}/{total_plots} · species {start_species_index}–{end_species_index if end_species_index is not None else len(species_names)}"
+    fig.suptitle(title, fontsize=13.2, color=text_color, fontweight="bold", y=0.988)
+    fig.text(0.5, 0.962, subtitle, ha="center", va="center", fontsize=9.8, color=text_color)
+
+    species_entries = [f"{code_map[species]}: {species}" for species in species_names]
+    legend_lines = []
+    current = ""
+    max_chars = 112
+    for entry in species_entries:
+        candidate = entry if not current else f"{current}    {entry}"
+        if len(candidate) > max_chars:
+            legend_lines.append(current)
+            current = entry
+        else:
+            current = candidate
+    if current:
+        legend_lines.append(current)
+
+    species_key_text = "\n".join(legend_lines)
+    caption = "*P < 0.05, **P < 0.01, ***P < 0.001"
+
+    bottom_margin = 0.095 + max(len(legend_lines) - 1, 0) * 0.026
+    bottom_margin = min(max(bottom_margin, 0.105), 0.22)
+
+    fig.text(0.012, 0.030, species_key_text, ha="left", va="bottom", fontsize=8.4, color=text_color)
+    fig.text(0.988, 0.030, caption, ha="right", va="bottom", fontsize=8.2, color=text_color)
+
+    # Leave room for top strips and right strips. Keep panels tight but prevent
+    # tick labels and strip labels from entering the plotting cells.
+    fig.subplots_adjust(
+        left=0.075,
+        right=0.905,
+        top=0.900,
+        bottom=bottom_margin,
+        wspace=0.055,
+        hspace=0.055,
+    )
+    return fig
+
+
+def save_multispecies_correlation_outputs(comparative_corr_df, output_dir, settings, prefix="Comparative_Multi_species_Correlation_Analysis"):
+    """Save chunked multi-species correlation figures and supporting CSV files."""
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if comparative_corr_df is None or comparative_corr_df.empty:
+        return
+
+    safe_prefix = sanitize_filename(prefix, fallback="Comparative_Multi_species_Correlation_Analysis")
+    comparative_corr_df.to_csv(out_dir / f"{safe_prefix}.gene_level_data.csv", index=False)
+
+    chunks = split_multispecies_correlation_chunks(
+        comparative_corr_df,
+        species_per_plot=settings.get("comparative_corr_species_per_plot", 10),
+    )
+    if chunks:
+        species_key_df = pd.concat([chunk["species_key_df"] for chunk in chunks], ignore_index=True)
+        species_key_df.to_csv(out_dir / f"{safe_prefix}.species_key.csv", index=False)
+    else:
+        species_key_df = pd.DataFrame(columns=["Species_code", "Species", "Input_block_start", "Input_block_end", "Plot_index"])
+
+    if not settings.get("save_figures", True):
+        return
+
+    formats = list(settings.get("formats") or [])
+    if not formats:
+        return
+
+    palette = get_plot_palette_by_name(
+        settings.get("comparative_corr_palette_name", settings.get("comparative_palette_name", settings.get("palette_name", "default")))
+    )
+    species_cmap = settings.get("comparative_corr_species_cmap_name", "tab10")
+    fig_width = max(float(settings.get("comparative_corr_fig_width", 20.0)), float(settings.get("fig_width", 8.0)))
+    fig_height = max(float(settings.get("comparative_corr_fig_height", 17.0)), float(settings.get("fig_height", 6.0)))
+
+    for chunk in chunks:
+        fig = create_multispecies_correlation_figure(
+            chunk["df"],
+            width=fig_width,
+            height=fig_height,
+            palette=palette,
+            species_cmap_name=species_cmap,
+            parameters=COMPARATIVE_CORRELATION_PARAMETERS,
+            plot_index=chunk["plot_index"],
+            total_plots=chunk["total_plots"],
+            start_species_index=chunk["start_species_index"],
+            end_species_index=chunk["end_species_index"],
+        )
+        try:
+            for fmt in formats:
+                ext = "tiff" if fmt == "tiff" else fmt
+                fig.savefig(out_dir / f"{safe_prefix}_Plot_{chunk['plot_index']:02d}.{ext}", dpi=EXPORT_DPI, bbox_inches="tight")
+        finally:
+            try:
+                fig.clf()
+                plt.close(fig)
+            except Exception:
+                pass
+
+def _enc_ratio_bin_metadata():
+    """Return metadata dictionaries for ENC-ratio classes."""
+    meta = {}
+    for key, label, lower, upper, color in ENC_RATIO_BIN_DEFINITIONS:
+        meta[key] = {"label": label, "lower": lower, "upper": upper, "color": color}
+    return meta
+
+
+def _get_enc_ratio_color_map(palette_name="publication_green"):
+    """Return colour mapping for ENC-ratio stacked-bar classes.
+
+    The bin order is numerical from low ENC-ratio values to high ENC-ratio
+    values. Sequential palettes are sampled from light to dark so the legend
+    remains intuitive. Qualitative palettes are sampled in a stable order.
+    """
+    name = str(palette_name or "publication_green")
+    bin_order = list(ENC_RATIO_LEGEND_ORDER)
+
+    fixed_palettes = {
+        "publication_green": {
+            "le_-0.20": "#f4fbf1",
+            "-0.20_-0.10": "#dcefd7",
+            "-0.10_0.00": "#98dc78",
+            "0.00_0.10": "#52c98b",
+            "0.10_0.20": "#10b7a1",
+            "0.20_0.30": "#089ba0",
+            "gt_0.30": "#056b86",
+        },
+        "green_teal_dark": {
+            "le_-0.20": "#edf8e9",
+            "-0.20_-0.10": "#c7e9c0",
+            "-0.10_0.00": "#74c476",
+            "0.00_0.10": "#31a354",
+            "0.10_0.20": "#1d91c0",
+            "0.20_0.30": "#225ea8",
+            "gt_0.30": "#0c2c84",
+        },
+        "blue_purple": {
+            "le_-0.20": "#f7fcfd",
+            "-0.20_-0.10": "#e0ecf4",
+            "-0.10_0.00": "#bfd3e6",
+            "0.00_0.10": "#9ebcda",
+            "0.10_0.20": "#8c96c6",
+            "0.20_0.30": "#8c6bb1",
+            "gt_0.30": "#6e016b",
+        },
+        "orange_red": {
+            "le_-0.20": "#fff7ec",
+            "-0.20_-0.10": "#fee8c8",
+            "-0.10_0.00": "#fdd49e",
+            "0.00_0.10": "#fdbb84",
+            "0.10_0.20": "#fc8d59",
+            "0.20_0.30": "#e34a33",
+            "gt_0.30": "#b30000",
+        },
+        "pink_teal": {
+            "le_-0.20": "#f7f7f7",
+            "-0.20_-0.10": "#e9a3c9",
+            "-0.10_0.00": "#d01c8b",
+            "0.00_0.10": "#f1b6da",
+            "0.10_0.20": "#b8e186",
+            "0.20_0.30": "#4dac26",
+            "gt_0.30": "#276419",
+        },
+    }
+
+    if name in fixed_palettes:
+        return fixed_palettes[name].copy()
+
+    try:
+        cmap = plt.get_cmap(name)
+    except Exception:
+        cmap = plt.get_cmap("viridis")
+
+    # Avoid extreme white/black endpoints and keep colors in low→high order.
+    positions = np.linspace(0.12, 0.88, len(bin_order))
+    colors = [_rgba_to_hex(cmap(float(pos))) for pos in positions]
+    return {key: color for key, color in zip(bin_order, colors)}
+
+
+def _assign_enc_ratio_bin(value):
+    """Assign one ENC-ratio value to a publication-style frequency class."""
+    try:
+        value = float(value)
+    except Exception:
+        return ""
+    if not np.isfinite(value):
+        return ""
+    for key, label, lower, upper, color in ENC_RATIO_BIN_DEFINITIONS:
+        if value > lower and value <= upper:
+            return key
+    return ""
+
+
+def build_multispecies_enc_ratio_dataset(batch_success_items, table_id=11):
+    """Build gene-level ENC-ratio data for comparative multi-species plotting.
+
+    ENC_ratio = (ENC_exp - ENC_obs) / ENC_exp
+
+    ENCobs is the observed ENC per CDS. ENCexp is the expected ENC calculated
+    from GC3 using Wright's expected ENC curve. Positive values mean ENCobs is
+    lower than the GC3-only expectation, suggesting stronger codon-bias
+    deviation from the mutation-only expectation.
+    """
+    output_columns = [
+        "Species", "Species_order", "Input_file", "label", "gene",
+        "ENC_obs", "ENC_exp", "ENC_ratio", "ENC_ratio_bin",
+        "ENC_ratio_bin_label", "L_aa",
+    ]
+    rows = []
+    if not batch_success_items:
+        return pd.DataFrame(columns=output_columns)
+
+    used_names = {}
+    bin_meta = _enc_ratio_bin_metadata()
+
+    for species_order, item in enumerate(batch_success_items, start=1):
+        data = item.get("data", {}) if isinstance(item, dict) else {}
+        file_name = str(item.get("file_name", "") or "")
+        base_species = _infer_species_name_from_batch_item(item, fallback_prefix=f"Species_{species_order}")
+        count = used_names.get(base_species, 0) + 1
+        used_names[base_species] = count
+        species_name = base_species if count == 1 else f"{base_species} ({count})"
+
+        for m in data.get("metrics_list", []) or []:
+            enc_obs = m.get("ENC", np.nan)
+            enc_exp = m.get("ENC_exp", m.get("ENC_expected", np.nan))
+            if pd.isna(enc_exp):
+                enc_exp = expected_enc(m.get("GC3", np.nan))
+            try:
+                enc_obs = float(enc_obs)
+                enc_exp = float(enc_exp)
+                enc_ratio = (enc_exp - enc_obs) / enc_exp if enc_exp and np.isfinite(enc_exp) else np.nan
+            except Exception:
+                enc_obs = np.nan
+                enc_exp = np.nan
+                enc_ratio = np.nan
+
+            bin_key = _assign_enc_ratio_bin(enc_ratio)
+            rows.append({
+                "Species": species_name,
+                "Species_order": species_order,
+                "Input_file": file_name,
+                "label": m.get("label", ""),
+                "gene": m.get("gene", ""),
+                "ENC_obs": enc_obs,
+                "ENC_exp": enc_exp,
+                "ENC_ratio": enc_ratio,
+                "ENC_ratio_bin": bin_key,
+                "ENC_ratio_bin_label": bin_meta.get(bin_key, {}).get("label", ""),
+                "L_aa": m.get("total_codons", m.get("length_codons", np.nan)),
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=output_columns)
+
+    out = pd.DataFrame(rows)
+    for col in ["ENC_obs", "ENC_exp", "ENC_ratio", "L_aa"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out[output_columns]
+
+
+def build_enc_ratio_frequency_table(enc_ratio_df):
+    """Convert gene-level ENC-ratio data into species × frequency-class proportions."""
+    bin_meta = _enc_ratio_bin_metadata()
+    base_columns = ["Species", "Species_order", "Species_axis_label", "N_genes"]
+    bin_columns = list(ENC_RATIO_STACK_ORDER)
+
+    if enc_ratio_df is None or enc_ratio_df.empty:
+        return pd.DataFrame(columns=base_columns + bin_columns)
+
+    valid = enc_ratio_df.copy()
+    valid = valid[pd.to_numeric(valid["ENC_ratio"], errors="coerce").notna()]
+    valid = valid[valid["ENC_ratio_bin"].astype(str) != ""]
+    if valid.empty:
+        return pd.DataFrame(columns=base_columns + bin_columns)
+
+    species_df = valid[["Species", "Species_order"]].drop_duplicates().sort_values(["Species_order", "Species"], kind="stable")
+    rows = []
+    for _, srow in species_df.iterrows():
+        species = srow["Species"]
+        species_order = int(srow["Species_order"])
+        sub = valid[valid["Species"] == species]
+        n = int(len(sub))
+        counts = sub["ENC_ratio_bin"].value_counts().to_dict()
+        row = {
+            "Species": species,
+            "Species_order": species_order,
+            "Species_axis_label": abbreviate_species_name_for_axis(species),
+            "N_genes": n,
+        }
+        for key in bin_columns:
+            row[key] = float(counts.get(key, 0) / n) if n else 0.0
+        rows.append(row)
+
+    return pd.DataFrame(rows, columns=base_columns + bin_columns)
+
+
+def split_multispecies_enc_ratio_chunks(enc_ratio_df, taxa_per_plot=10):
+    """Split ENC-ratio frequency data into taxa chunks for multiple stacked-bar plots."""
+    if enc_ratio_df is None or enc_ratio_df.empty:
+        return []
+
+    taxa_per_plot = max(int(taxa_per_plot or 10), 1)
+    freq_df = build_enc_ratio_frequency_table(enc_ratio_df)
+    if freq_df.empty:
+        return []
+
+    freq_df = freq_df.sort_values(["Species_order", "Species"], kind="stable").reset_index(drop=True)
+    chunks = []
+    total_species = len(freq_df)
+    for start in range(0, total_species, taxa_per_plot):
+        chunk_freq = freq_df.iloc[start:start + taxa_per_plot].copy().reset_index(drop=True)
+        species_names = chunk_freq["Species"].tolist()
+        chunk_gene = enc_ratio_df[enc_ratio_df["Species"].isin(species_names)].copy()
+        plot_index = (start // taxa_per_plot) + 1
+        total_plots = int(np.ceil(total_species / taxa_per_plot))
+        species_key_df = pd.DataFrame({
+            "Plot_index": plot_index,
+            "Species_axis_label": chunk_freq["Species_axis_label"],
+            "Species": chunk_freq["Species"],
+            "N_genes": chunk_freq["N_genes"],
+        })
+        chunks.append({
+            "plot_index": plot_index,
+            "total_plots": total_plots,
+            "start_species_index": start + 1,
+            "end_species_index": min(start + len(chunk_freq), total_species),
+            "frequency_df": chunk_freq,
+            "gene_level_df": chunk_gene,
+            "species_key_df": species_key_df,
+        })
+    return chunks
+
+
+def create_multispecies_enc_ratio_frequency_figure(
+    enc_ratio_frequency_df,
+    width=12.0,
+    height=7.0,
+    palette=None,
+    enc_ratio_color_palette="publication_green",
+    plot_index=1,
+    total_plots=1,
+    start_species_index=1,
+    end_species_index=None,
+):
+    """Create a stacked ENC-ratio frequency-distribution plot for one species chunk."""
+    palette = palette or get_plot_palette_by_name("default")
+    if enc_ratio_frequency_df is None or enc_ratio_frequency_df.empty:
+        fig, ax = plt.subplots(figsize=(max(float(width), 8.0), max(float(height), 5.0)))
+        fig.patch.set_facecolor(palette["figure_bg"])
+        ax.text(0.5, 0.5, "No ENC-ratio frequency data available", ha="center", va="center", color=palette["text"])
+        ax.axis("off")
+        return fig
+
+    freq_df = enc_ratio_frequency_df.copy()
+    bin_meta = _enc_ratio_bin_metadata()
+    color_map = _get_enc_ratio_color_map(enc_ratio_color_palette)
+
+    # Display only bins that are present in this plot. This keeps the legend
+    # close to the published five-bin style unless extreme values actually occur.
+    present_bins = [key for key in ENC_RATIO_STACK_ORDER if key in freq_df.columns and float(freq_df[key].sum()) > 0]
+    if not present_bins:
+        present_bins = [key for key in ENC_RATIO_STACK_ORDER if key in freq_df.columns]
+
+    n_species = len(freq_df)
+    width = max(float(width), max(9.0, 3.8 + n_species * 0.72))
+    height = max(float(height), 6.5)
+
+    fig, ax = plt.subplots(figsize=(width, height))
+    fig.patch.set_facecolor(palette["figure_bg"])
+    ax.set_facecolor(_mix_color_with_white(palette["axes_bg"], amount=0.08))
+
+    x = np.arange(n_species)
+    bottoms = np.zeros(n_species, dtype=float)
+
+    for key in present_bins:
+        values = pd.to_numeric(freq_df[key], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        label = bin_meta.get(key, {}).get("label", key)
+        color = color_map.get(key, bin_meta.get(key, {}).get("color", "#999999"))
+        ax.bar(
+            x,
+            values,
+            bottom=bottoms,
+            width=0.62,
+            label=label,
+            color=color,
+            edgecolor="#ffffff",
+            linewidth=0.9,
+        )
+        bottoms += values
+
+    ax.set_ylim(0, 1.0)
+    ax.set_ylabel("Percentage", fontsize=12.0, color=palette["text"], fontweight="bold")
+    ax.set_xlabel("Species", fontsize=11.0, color=palette["text"], fontweight="bold", labelpad=10)
+    ax.set_xticks(x)
+    ax.set_xticklabels(freq_df["Species_axis_label"].astype(str).tolist(), rotation=90, ha="center", va="top", fontsize=9.0)
+    ax.set_yticks(np.linspace(0.0, 1.0, 5))
+    ax.set_yticklabels([f"{v:.2f}" for v in np.linspace(0.0, 1.0, 5)], fontsize=9.0, color=palette["text"])
+
+    ax.grid(True, axis="y", color=palette.get("grid", "#d9d9d9"), linewidth=0.8, alpha=0.72)
+    ax.grid(False, axis="x")
+    ax.set_axisbelow(True)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+    for spine in ["left", "bottom"]:
+        ax.spines[spine].set_color(palette.get("grid", "#d9d9d9"))
+        ax.spines[spine].set_linewidth(0.9)
+
+    title = "Comparative ENC ratio frequency distribution"
+    subtitle = f"Species block {plot_index}/{total_plots} · species {start_species_index}–{end_species_index if end_species_index is not None else n_species}"
+
+    # Use figure-level title/subtitle rather than an axes title so the two
+    # lines never collide when Streamlit scales the figure preview.
+    fig.suptitle(
+        title,
+        fontsize=14.0,
+        color=palette["text"],
+        fontweight="bold",
+        y=0.975,
+    )
+    fig.text(
+        0.5,
+        0.935,
+        subtitle,
+        ha="center",
+        va="center",
+        fontsize=10.0,
+        color=palette["text"],
+    )
+
+    # Legend ordered light-to-dark like the published figure.
+    handles, labels = ax.get_legend_handles_labels()
+    handle_map = dict(zip(labels, handles))
+    legend_labels = [bin_meta[k]["label"] for k in ENC_RATIO_LEGEND_ORDER if k in present_bins]
+    legend_handles = [handle_map[label] for label in legend_labels if label in handle_map]
+    if legend_handles:
+        ax.legend(
+            legend_handles,
+            legend_labels,
+            title="ENC ratio",
+            frameon=False,
+            bbox_to_anchor=(1.02, 0.5),
+            loc="center left",
+            fontsize=9.0,
+            title_fontsize=10.0,
+        )
+
+    caption = r"ENC ratio = (ENC$_{exp}$ − ENC$_{obs}$) / ENC$_{exp}$"
+    fig.text(0.012, 0.025, caption, ha="left", va="bottom", fontsize=9.0, color=palette["text"])
+
+    # Keep a compact but clean title block. The axes top is moved upward so
+    # the bar area starts closer to the species-block subtitle without overlap.
+    fig.subplots_adjust(left=0.075, right=0.82, top=0.885, bottom=0.24)
+    return fig
+
+
+def save_multispecies_enc_ratio_outputs(enc_ratio_df, output_dir, settings, prefix="Comparative_ENC_Ratio_Frequency_Distribution"):
+    """Save ENC-ratio gene-level table, frequency table, species keys, and chunked figures."""
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if enc_ratio_df is None or enc_ratio_df.empty:
+        return
+
+    safe_prefix = sanitize_filename(prefix, fallback="Comparative_ENC_Ratio_Frequency_Distribution")
+    enc_ratio_df.to_csv(out_dir / f"{safe_prefix}.gene_level_data.csv", index=False)
+
+    frequency_df = build_enc_ratio_frequency_table(enc_ratio_df)
+    if not frequency_df.empty:
+        frequency_df.to_csv(out_dir / f"{safe_prefix}.frequency_table.csv", index=False)
+
+    chunks = split_multispecies_enc_ratio_chunks(
+        enc_ratio_df,
+        taxa_per_plot=settings.get("comparative_enc_ratio_taxa_per_plot", 10),
+    )
+    if chunks:
+        species_key_df = pd.concat([chunk["species_key_df"] for chunk in chunks], ignore_index=True)
+        species_key_df.to_csv(out_dir / f"{safe_prefix}.species_key.csv", index=False)
+
+    if not settings.get("save_figures", True):
+        return
+
+    formats = list(settings.get("formats") or [])
+    if not formats:
+        return
+
+    palette = get_plot_palette_by_name(
+        settings.get("comparative_enc_ratio_palette_name", settings.get("comparative_palette_name", settings.get("palette_name", "default")))
+    )
+    fig_width = max(float(settings.get("comparative_enc_ratio_fig_width", 12.0)), float(settings.get("fig_width", 8.0)))
+    fig_height = max(float(settings.get("comparative_enc_ratio_fig_height", 7.0)), float(settings.get("fig_height", 6.0)))
+    enc_ratio_color_palette = settings.get("comparative_enc_ratio_color_palette", "publication_green")
+
+    for chunk in chunks:
+        fig = create_multispecies_enc_ratio_frequency_figure(
+            chunk["frequency_df"],
+            width=fig_width,
+            height=fig_height,
+            palette=palette,
+            enc_ratio_color_palette=enc_ratio_color_palette,
+            plot_index=chunk["plot_index"],
+            total_plots=chunk["total_plots"],
+            start_species_index=chunk["start_species_index"],
+            end_species_index=chunk["end_species_index"],
+        )
+        try:
+            for fmt in formats:
+                ext = "tiff" if fmt == "tiff" else fmt
+                fig.savefig(out_dir / f"{safe_prefix}_Plot_{chunk['plot_index']:02d}.{ext}", dpi=EXPORT_DPI, bbox_inches="tight")
+        finally:
+            try:
+                fig.clf()
+                plt.close(fig)
+            except Exception:
+                pass
+
+
+
 def _get_comparative_rscu_colormap(cmap_name="green_pink_publication"):
     """Return a Matplotlib colormap object/name for comparative RSCU heatmaps."""
     name = str(cmap_name or "green_pink_publication")
@@ -2332,6 +3363,7 @@ def create_comparative_rscu_heatmap_figure(
     species_order="hierarchical_clustering",
     codon_order="hierarchical_clustering",
     show_dendrograms=True,
+    table_id=None,
 ):
     """
     Create a comparative multi-species RSCU heatmap.
@@ -4438,7 +5470,7 @@ def _make_single_output_zip(data, uploaded_name, settings):
 
 
 def _run_batch_analysis_streamlit(uploaded_files, settings):
-    """Run the original batch workflow inside Streamlit and return logs plus zip bytes."""
+    """Run the batch workflow inside Streamlit and return logs, ZIP bytes, and comparative matrices."""
     if len(uploaded_files or []) > BATCH_FILE_LIMIT:
         raise ValueError(f"Batch upload limit exceeded. Please upload a maximum of {BATCH_FILE_LIMIT} GenBank files.")
 
@@ -4667,6 +5699,14 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
             batch_success_items,
             table_id=settings.get("table_id", 11),
         )
+        comparative_corr_df = build_multispecies_correlation_dataset(
+            batch_success_items,
+            table_id=settings.get("table_id", 11),
+        )
+        comparative_enc_ratio_df = build_multispecies_enc_ratio_dataset(
+            batch_success_items,
+            table_id=settings.get("table_id", 11),
+        )
         comparative_dir = batch_root / "02_Comparative_Analysis"
         if comparative_rscu_df is not None and not comparative_rscu_df.empty:
             save_comparative_rscu_outputs(
@@ -4682,6 +5722,20 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
                 settings,
                 prefix="Comparative_Multi_species_Optimal_Codon_Heatmap",
             )
+        if comparative_corr_df is not None and not comparative_corr_df.empty:
+            save_multispecies_correlation_outputs(
+                comparative_corr_df,
+                comparative_dir,
+                settings,
+                prefix="Comparative_Multi_species_Correlation_Analysis",
+            )
+        if comparative_enc_ratio_df is not None and not comparative_enc_ratio_df.empty:
+            save_multispecies_enc_ratio_outputs(
+                comparative_enc_ratio_df,
+                comparative_dir,
+                settings,
+                prefix="Comparative_ENC_Ratio_Frequency_Distribution",
+            )
 
         workbook_tables = {"Batch_Run_Log": log_df}
         if comparative_rscu_df is not None and not comparative_rscu_df.empty:
@@ -4692,6 +5746,19 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
                 comparative_optimal_df,
                 table_id=settings.get("table_id", 11),
             )
+        if comparative_corr_df is not None and not comparative_corr_df.empty:
+            workbook_tables["Comparative_Correlation_Data"] = comparative_corr_df
+            species_key_parts = [chunk["species_key_df"] for chunk in split_multispecies_correlation_chunks(comparative_corr_df, species_per_plot=settings.get("comparative_corr_species_per_plot", 10))]
+            if species_key_parts:
+                workbook_tables["Comparative_Correlation_Key"] = pd.concat(species_key_parts, ignore_index=True)
+        if comparative_enc_ratio_df is not None and not comparative_enc_ratio_df.empty:
+            workbook_tables["Comparative_ENC_Ratio_Data"] = comparative_enc_ratio_df
+            enc_ratio_frequency_df = build_enc_ratio_frequency_table(comparative_enc_ratio_df)
+            if enc_ratio_frequency_df is not None and not enc_ratio_frequency_df.empty:
+                workbook_tables["Comparative_ENC_Ratio_Frequency"] = enc_ratio_frequency_df
+            enc_ratio_key_parts = [chunk["species_key_df"] for chunk in split_multispecies_enc_ratio_chunks(comparative_enc_ratio_df, taxa_per_plot=settings.get("comparative_enc_ratio_taxa_per_plot", 10))]
+            if enc_ratio_key_parts:
+                workbook_tables["Comparative_ENC_Ratio_Key"] = pd.concat(enc_ratio_key_parts, ignore_index=True)
         for sheet, parts in combined.items():
             if parts:
                 workbook_tables[sheet] = pd.concat(parts, ignore_index=True)
@@ -4701,7 +5768,7 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
         failed = int((log_df["Status"] == "Failed").sum()) if not log_df.empty else 0
         status_box.success(f"Batch complete: {done} succeeded, {failed} failed.")
         zip_bytes = _zip_directory_to_bytes(batch_root)
-        return log_df, zip_bytes, comparative_rscu_df, comparative_optimal_df
+        return log_df, zip_bytes, comparative_rscu_df, comparative_optimal_df, comparative_corr_df, comparative_enc_ratio_df
 
 
 def _sidebar_settings():
@@ -4885,6 +5952,89 @@ def _sidebar_settings():
             help="When hierarchical ordering is selected, show row/column dendrograms around the heatmap.",
         )
 
+    with st.sidebar.expander("Comparative correlation plot styling", expanded=True):
+        comparative_corr_palette_name = st.selectbox(
+            "Comparative correlation theme",
+            theme_options,
+            index=theme_options.index("default"),
+            help="Controls background, labels, grid, and text styling for the multi-species correlation matrix plot.",
+        )
+        comparative_corr_species_cmap_name = st.selectbox(
+            "Species colour palette",
+            COMPARATIVE_CORRELATION_SPECIES_CMAPS,
+            index=COMPARATIVE_CORRELATION_SPECIES_CMAPS.index("tab10"),
+            help="Controls how species are coloured inside the multi-species correlation plots.",
+        )
+        comparative_corr_species_per_plot = st.number_input(
+            "Species per correlation plot",
+            min_value=1,
+            max_value=50,
+            value=10,
+            step=1,
+            help="The app automatically splits the batch into species blocks of this size. Example: 1–10, 11–20, 21–30.",
+        )
+        comparative_corr_fig_width = st.number_input(
+            "Comparative correlation figure width",
+            min_value=10.0,
+            max_value=40.0,
+            value=20.0,
+            step=0.5,
+            help="Recommended larger width because this plot contains an 8 × 8 panel matrix.",
+        )
+        comparative_corr_fig_height = st.number_input(
+            "Comparative correlation figure height",
+            min_value=8.0,
+            max_value=40.0,
+            value=17.0,
+            step=0.5,
+            help="Recommended larger height because this plot contains an 8 × 8 panel matrix plus the species key.",
+        )
+
+    with st.sidebar.expander("Comparative ENC ratio plot styling", expanded=True):
+        comparative_enc_ratio_palette_name = st.selectbox(
+            "ENC ratio plot theme",
+            theme_options,
+            index=theme_options.index("default"),
+            help="Controls background, grid, text, and axis styling for the comparative ENC ratio frequency plot.",
+        )
+        comparative_enc_ratio_color_palette = st.selectbox(
+            "ENC ratio bar colour palette",
+            ENC_RATIO_COLOR_PALETTE_OPTIONS,
+            index=ENC_RATIO_COLOR_PALETTE_OPTIONS.index("publication_green"),
+            format_func=lambda x: {
+                "publication_green": "Publication green",
+                "green_teal_dark": "Green → teal → dark blue",
+                "blue_purple": "Blue → purple",
+                "orange_red": "Orange → red",
+                "pink_teal": "Pink ↔ teal",
+            }.get(x, x),
+            help="Controls the stacked-bar colours for ENC-ratio classes.",
+        )
+        comparative_enc_ratio_taxa_per_plot = st.number_input(
+            "Taxa per ENC ratio plot",
+            min_value=1,
+            max_value=50,
+            value=10,
+            step=1,
+            help="The app automatically splits the ENC ratio plot into taxa blocks of this size. Example: 1–10, 11–20, 21–30.",
+        )
+        comparative_enc_ratio_fig_width = st.number_input(
+            "ENC ratio figure width",
+            min_value=7.0,
+            max_value=40.0,
+            value=12.0,
+            step=0.5,
+            help="Recommended width for the stacked-bar ENC ratio frequency distribution plot.",
+        )
+        comparative_enc_ratio_fig_height = st.number_input(
+            "ENC ratio figure height",
+            min_value=4.0,
+            max_value=30.0,
+            value=7.0,
+            step=0.5,
+            help="Recommended height for the stacked-bar ENC ratio frequency distribution plot.",
+        )
+
     with st.sidebar.expander("Export settings", expanded=True):
         single_plot_download_format = st.selectbox(
             "Single plot quick-download format",
@@ -4916,6 +6066,16 @@ def _sidebar_settings():
         "comparative_species_order": comparative_species_order,
         "comparative_codon_order": comparative_codon_order,
         "comparative_show_dendrograms": bool(comparative_show_dendrograms),
+        "comparative_corr_palette_name": comparative_corr_palette_name,
+        "comparative_corr_species_cmap_name": comparative_corr_species_cmap_name,
+        "comparative_corr_species_per_plot": int(comparative_corr_species_per_plot),
+        "comparative_corr_fig_width": float(comparative_corr_fig_width),
+        "comparative_corr_fig_height": float(comparative_corr_fig_height),
+        "comparative_enc_ratio_palette_name": comparative_enc_ratio_palette_name,
+        "comparative_enc_ratio_color_palette": comparative_enc_ratio_color_palette,
+        "comparative_enc_ratio_taxa_per_plot": int(comparative_enc_ratio_taxa_per_plot),
+        "comparative_enc_ratio_fig_width": float(comparative_enc_ratio_fig_width),
+        "comparative_enc_ratio_fig_height": float(comparative_enc_ratio_fig_height),
         "rscu_stack_scheme": rscu_stack_scheme,
         "rscu_stack_cmap_name": rscu_stack_cmap_name,
         "rscu_stack_seed": rscu_stack_seed,
@@ -4993,6 +6153,16 @@ def _export_settings_signature(settings):
         "comparative_species_order",
         "comparative_codon_order",
         "comparative_show_dendrograms",
+        "comparative_corr_palette_name",
+        "comparative_corr_species_cmap_name",
+        "comparative_corr_species_per_plot",
+        "comparative_corr_fig_width",
+        "comparative_corr_fig_height",
+        "comparative_enc_ratio_palette_name",
+        "comparative_enc_ratio_color_palette",
+        "comparative_enc_ratio_taxa_per_plot",
+        "comparative_enc_ratio_fig_width",
+        "comparative_enc_ratio_fig_height",
         "rscu_stack_scheme",
         "rscu_stack_cmap_name",
         "correlation_palette_name",
@@ -5039,6 +6209,8 @@ def _clear_batch_result_state():
         "batch_result_zip_filename",
         "batch_comparative_rscu_df",
         "batch_comparative_optimal_df",
+        "batch_comparative_corr_df",
+        "batch_comparative_enc_ratio_df",
         "batch_result_signature",
         "batch_result_error",
         "batch_result_section",
@@ -5180,8 +6352,8 @@ def _render_single_mode(settings):
 
 
 
-def _render_comparative_analysis_dashboard(comparative_rscu_df, comparative_optimal_df, settings):
-    """Render batch-level comparative plots that require two or more GenBank files."""
+def _render_comparative_analysis_dashboard(comparative_rscu_df, comparative_optimal_df, comparative_corr_df, comparative_enc_ratio_df, settings):
+    """Render batch-level comparative plots that require one or more valid GenBank files."""
     st.markdown(
         """
         <div class="cc-panel">
@@ -5194,90 +6366,247 @@ def _render_comparative_analysis_dashboard(comparative_rscu_df, comparative_opti
 
     has_rscu = comparative_rscu_df is not None and not comparative_rscu_df.empty
     has_optimal = comparative_optimal_df is not None and not comparative_optimal_df.empty
-    if not has_rscu and not has_optimal:
-        st.info("No comparative matrices are available. Run batch analysis with at least two valid GenBank files.")
+    has_corr = comparative_corr_df is not None and not comparative_corr_df.empty
+    has_enc_ratio = comparative_enc_ratio_df is not None and not comparative_enc_ratio_df.empty
+
+    if not has_rscu and not has_optimal and not has_corr and not has_enc_ratio:
+        st.info("No comparative outputs are available. Run batch analysis with at least one valid GenBank file.")
         return
 
-    n_species = len(comparative_rscu_df) if has_rscu else len(comparative_optimal_df)
+    n_species_corr = int(comparative_corr_df[["Species", "Species_order"]].drop_duplicates().shape[0]) if has_corr else 0
+    n_species_enc_ratio = int(comparative_enc_ratio_df[["Species", "Species_order"]].drop_duplicates().shape[0]) if has_enc_ratio else 0
+    n_species_rscu = int(len(comparative_rscu_df)) if has_rscu else 0
+    n_species_optimal = int(len(comparative_optimal_df)) if has_optimal else 0
+    n_species = max(n_species_corr, n_species_enc_ratio, n_species_rscu, n_species_optimal)
+
+    n_corr_genes = int(len(comparative_corr_df)) if has_corr else 0
+    n_enc_ratio_genes = int(pd.to_numeric(comparative_enc_ratio_df["ENC_ratio"], errors="coerce").notna().sum()) if has_enc_ratio and "ENC_ratio" in comparative_enc_ratio_df.columns else 0
     n_codons = len([c for c in CODON_ORDER if has_rscu and c in comparative_rscu_df.columns])
     n_optimal_codons = len([c for c in _sense_codon_order_for_table(settings.get("table_id", 11)) if has_optimal and c in comparative_optimal_df.columns])
-    c1, c2, c3 = st.columns(3)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         _metric_card("Species/files", _format_metric_value(n_species, integer=True), "successful batch analyses")
     with c2:
-        _metric_card("RSCU codons", _format_metric_value(n_codons, integer=True), "all codons")
+        _metric_card("Correlation genes", _format_metric_value(n_corr_genes, integer=True), "per-gene GC/composition-index rows")
     with c3:
-        _metric_card("Optimal codon columns", _format_metric_value(n_optimal_codons, integer=True), "sense codons")
+        _metric_card("ENC ratio genes", _format_metric_value(n_enc_ratio_genes, integer=True), "valid ENC-ratio CDS rows")
+    with c4:
+        _metric_card("RSCU codons", _format_metric_value(n_codons, integer=True), "64-codon matrix columns")
+    with c5:
+        _metric_card("Optimal codon columns", _format_metric_value(n_optimal_codons, integer=True), "sense-codon status columns")
 
-    if n_species < 2:
-        st.warning("Comparative heatmap preview requires at least two successfully analyzed GenBank files.")
-        if has_rscu:
-            _dataframe_download_button(
-                comparative_rscu_df,
-                "Comparative_Multi_species_RSCU_Heatmap.matrix.csv",
-                "Download comparative RSCU matrix CSV",
-            )
-        if has_optimal:
-            _dataframe_download_button(
-                comparative_optimal_df,
-                "Comparative_Multi_species_Optimal_Codon_Heatmap.status_matrix.csv",
-                "Download comparative optimal-codon status matrix CSV",
-            )
-        return
-
-    palette = get_plot_palette_by_name(settings.get("comparative_palette_name", settings.get("palette_name", "default")))
-
-    if has_rscu:
-        fig = create_comparative_rscu_heatmap_figure(
-            comparative_rscu_df,
-            settings.get("fig_width", 12.0),
-            settings.get("fig_height", 7.0),
-            palette,
-            cmap_name=settings.get("comparative_rscu_cmap_name", "green_pink_publication"),
-            species_order=settings.get("comparative_species_order", "hierarchical_clustering"),
-            codon_order=settings.get("comparative_codon_order", "hierarchical_clustering"),
-            show_dendrograms=settings.get("comparative_show_dendrograms", True),
+    # ------------------------------------------------------------------
+    # 1) Multi-species correlation plots
+    # ------------------------------------------------------------------
+    if has_corr:
+        species_per_plot = int(settings.get("comparative_corr_species_per_plot", 10))
+        chunks = split_multispecies_correlation_chunks(comparative_corr_df, species_per_plot=species_per_plot)
+        palette_corr = get_plot_palette_by_name(
+            settings.get("comparative_corr_palette_name", settings.get("comparative_palette_name", settings.get("palette_name", "default")))
         )
 
+        st.markdown(
+            "<div class='cc-panel'><div class='cc-section-title'>Comparative multi-species correlation plots</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"Each figure contains up to {species_per_plot} species and uses GC1, GC2, GC3, GC_all, GC3s, CAI, ENC, and L_aa. "
+            f"If more than {species_per_plot} species are uploaded, the app automatically creates multiple plots."
+        )
+
+        if chunks:
+            st.info(f"Prepared {len(chunks)} comparative correlation plot(s) from {n_species_corr} species.")
+
+        for chunk in chunks:
+            fig_corr = create_multispecies_correlation_figure(
+                chunk["df"],
+                width=max(float(settings.get("comparative_corr_fig_width", 20.0)), float(settings.get("fig_width", 8.0))),
+                height=max(float(settings.get("comparative_corr_fig_height", 17.0)), float(settings.get("fig_height", 6.0))),
+                palette=palette_corr,
+                species_cmap_name=settings.get("comparative_corr_species_cmap_name", "tab10"),
+                parameters=COMPARATIVE_CORRELATION_PARAMETERS,
+                plot_index=chunk["plot_index"],
+                total_plots=chunk["total_plots"],
+                start_species_index=chunk["start_species_index"],
+                end_species_index=chunk["end_species_index"],
+            )
+
+            st.markdown(
+                f"<div class='cc-panel cc-panel-tight'><b>Correlation plot {chunk['plot_index']} of {chunk['total_plots']}</b> · species {chunk['start_species_index']}–{chunk['end_species_index']} of {n_species_corr}</div>",
+                unsafe_allow_html=True,
+            )
+            st.pyplot(fig_corr, clear_figure=False, use_container_width=True)
+
+            _render_single_plot_download_button(
+                fig_corr,
+                f"Comparative_Multi_species_Correlation_Analysis_Plot_{chunk['plot_index']:02d}",
+                settings,
+                key_prefix=f"batch_corr_plot_{chunk['plot_index']:02d}",
+            )
+            _dataframe_download_button(
+                chunk["species_key_df"],
+                f"Comparative_Multi_species_Correlation_Analysis_Plot_{chunk['plot_index']:02d}.species_key.csv",
+                f"Download plot {chunk['plot_index']} species key CSV",
+            )
+
+            try:
+                plt.close(fig_corr)
+            except Exception:
+                pass
+
+        _dataframe_download_button(
+            comparative_corr_df,
+            "Comparative_Multi_species_Correlation_Analysis.gene_level_data.csv",
+            "Download comparative correlation gene-level CSV",
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.warning("Comparative correlation data are unavailable. This usually means no valid gene-level COA/metric rows were produced.")
+
+    # ------------------------------------------------------------------
+    # 2) Comparative ENC ratio frequency distribution plot
+    # ------------------------------------------------------------------
+    if has_enc_ratio:
+        taxa_per_plot = int(settings.get("comparative_enc_ratio_taxa_per_plot", 10))
+        chunks = split_multispecies_enc_ratio_chunks(comparative_enc_ratio_df, taxa_per_plot=taxa_per_plot)
+        palette_enc_ratio = get_plot_palette_by_name(
+            settings.get("comparative_enc_ratio_palette_name", settings.get("comparative_palette_name", settings.get("palette_name", "default")))
+        )
+
+        st.markdown(
+            "<div class='cc-panel'><div class='cc-section-title'>Comparative ENC ratio frequency distribution</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "ENC ratio is calculated as (ENCexp − ENCobs) / ENCexp for every accepted CDS. "
+            f"Each stacked bar shows the frequency distribution per species; each figure contains up to {taxa_per_plot} taxa."
+        )
+
+        if chunks:
+            st.info(f"Prepared {len(chunks)} ENC ratio frequency plot(s) from {n_species_enc_ratio} taxa.")
+
+        for chunk in chunks:
+            fig_enc_ratio = create_multispecies_enc_ratio_frequency_figure(
+                chunk["frequency_df"],
+                width=max(float(settings.get("comparative_enc_ratio_fig_width", 12.0)), float(settings.get("fig_width", 8.0))),
+                height=max(float(settings.get("comparative_enc_ratio_fig_height", 7.0)), float(settings.get("fig_height", 6.0))),
+                palette=palette_enc_ratio,
+                enc_ratio_color_palette=settings.get("comparative_enc_ratio_color_palette", "publication_green"),
+                plot_index=chunk["plot_index"],
+                total_plots=chunk["total_plots"],
+                start_species_index=chunk["start_species_index"],
+                end_species_index=chunk["end_species_index"],
+            )
+            st.markdown(
+                f"<div class='cc-panel cc-panel-tight'><b>ENC ratio plot {chunk['plot_index']} of {chunk['total_plots']}</b> · taxa {chunk['start_species_index']}–{chunk['end_species_index']} of {n_species_enc_ratio}</div>",
+                unsafe_allow_html=True,
+            )
+            st.pyplot(fig_enc_ratio, clear_figure=False, use_container_width=True)
+            _render_single_plot_download_button(
+                fig_enc_ratio,
+                f"Comparative_ENC_Ratio_Frequency_Distribution_Plot_{chunk['plot_index']:02d}",
+                settings,
+                key_prefix=f"batch_enc_ratio_plot_{chunk['plot_index']:02d}",
+            )
+            _dataframe_download_button(
+                chunk["species_key_df"],
+                f"Comparative_ENC_Ratio_Frequency_Distribution_Plot_{chunk['plot_index']:02d}.species_key.csv",
+                f"Download ENC ratio plot {chunk['plot_index']} species key CSV",
+            )
+            try:
+                plt.close(fig_enc_ratio)
+            except Exception:
+                pass
+
+        frequency_df = build_enc_ratio_frequency_table(comparative_enc_ratio_df)
+        _dataframe_download_button(
+            comparative_enc_ratio_df,
+            "Comparative_ENC_Ratio_Frequency_Distribution.gene_level_data.csv",
+            "Download ENC ratio gene-level CSV",
+        )
+        _dataframe_download_button(
+            frequency_df,
+            "Comparative_ENC_Ratio_Frequency_Distribution.frequency_table.csv",
+            "Download ENC ratio frequency table CSV",
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.warning("Comparative ENC ratio data are unavailable. Check whether ENC and expected ENC values were generated for valid CDSs.")
+
+    # ------------------------------------------------------------------
+    # 3) Comparative RSCU heatmap
+    # ------------------------------------------------------------------
+    if has_rscu:
         st.markdown(
             "<div class='cc-panel'><div class='cc-section-title'>Comparative Multi-species RSCU Heatmap</div>",
             unsafe_allow_html=True,
         )
         st.caption("Rows represent species/files, columns represent the 64 codons, and colour intensity represents genome-level RSCU value from accepted cp CDSs.")
-        st.pyplot(fig, clear_figure=False, use_container_width=True)
-        _render_single_plot_download_button(fig, "Comparative_Multi_species_RSCU_Heatmap", settings, key_prefix="batch_comparative")
+
+        if len(comparative_rscu_df) < 2:
+            st.warning("RSCU heatmap preview needs at least two successfully analyzed GenBank files. The CSV matrix is still available.")
+        else:
+            palette_heatmap = get_plot_palette_by_name(settings.get("comparative_palette_name", settings.get("palette_name", "default")))
+            fig_rscu = create_comparative_rscu_heatmap_figure(
+                comparative_rscu_df,
+                settings.get("fig_width", 12.0),
+                settings.get("fig_height", 7.0),
+                palette_heatmap,
+                cmap_name=settings.get("comparative_rscu_cmap_name", "green_pink_publication"),
+                species_order=settings.get("comparative_species_order", "hierarchical_clustering"),
+                codon_order=settings.get("comparative_codon_order", "hierarchical_clustering"),
+                show_dendrograms=settings.get("comparative_show_dendrograms", True),
+                table_id=settings.get("table_id", 11),
+            )
+            st.pyplot(fig_rscu, clear_figure=False, use_container_width=True)
+            _render_single_plot_download_button(fig_rscu, "Comparative_Multi_species_RSCU_Heatmap", settings, key_prefix="batch_comparative_rscu")
+            try:
+                plt.close(fig_rscu)
+            except Exception:
+                pass
+
         _dataframe_download_button(
             comparative_rscu_df,
             "Comparative_Multi_species_RSCU_Heatmap.matrix.csv",
             "Download comparative RSCU matrix CSV",
         )
         st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.warning("Comparative RSCU matrix is unavailable. Check whether at least one uploaded GenBank file completed successfully.")
 
-        try:
-            plt.close(fig)
-        except Exception:
-            pass
-
+    # ------------------------------------------------------------------
+    # 4) Comparative optimal-codon heatmap
+    # ------------------------------------------------------------------
     if has_optimal:
-        fig_opt = create_comparative_optimal_codon_heatmap_figure(
-            comparative_optimal_df,
-            settings.get("fig_width", 12.0),
-            settings.get("fig_height", 7.0),
-            palette,
-            cmap_name=settings.get("comparative_optimal_cmap_name", "publication_blue"),
-            species_order=settings.get("comparative_species_order", "hierarchical_clustering"),
-            codon_order=settings.get("comparative_codon_order", "hierarchical_clustering"),
-            show_dendrograms=settings.get("comparative_show_dendrograms", True),
-            table_id=settings.get("table_id", 11),
-        )
-
         st.markdown(
             "<div class='cc-panel'><div class='cc-section-title'>Comparative Multi-species Optimal Codon Heatmap</div>",
             unsafe_allow_html=True,
         )
         st.caption("Rows represent species/files, columns represent sense codons, and cell colour represents optimal-codon status: grey = not high-frequency, white = RSCU > 1, light blue = RSCU > 1 and ΔRSCU ≥ 0.08.")
-        st.pyplot(fig_opt, clear_figure=False, use_container_width=True)
-        _render_single_plot_download_button(fig_opt, "Comparative_Multi_species_Optimal_Codon_Heatmap", settings, key_prefix="batch_comparative_optimal")
+
+        if len(comparative_optimal_df) < 2:
+            st.warning("Optimal-codon heatmap preview needs at least two successfully analyzed GenBank files. The CSV matrix is still available.")
+        else:
+            palette_heatmap = get_plot_palette_by_name(settings.get("comparative_palette_name", settings.get("palette_name", "default")))
+            fig_opt = create_comparative_optimal_codon_heatmap_figure(
+                comparative_optimal_df,
+                settings.get("fig_width", 12.0),
+                settings.get("fig_height", 7.0),
+                palette_heatmap,
+                cmap_name=settings.get("comparative_optimal_cmap_name", "publication_blue"),
+                species_order=settings.get("comparative_species_order", "hierarchical_clustering"),
+                codon_order=settings.get("comparative_codon_order", "hierarchical_clustering"),
+                show_dendrograms=settings.get("comparative_show_dendrograms", True),
+                table_id=settings.get("table_id", 11),
+            )
+            st.pyplot(fig_opt, clear_figure=False, use_container_width=True)
+            _render_single_plot_download_button(fig_opt, "Comparative_Multi_species_Optimal_Codon_Heatmap", settings, key_prefix="batch_comparative_optimal")
+            try:
+                plt.close(fig_opt)
+            except Exception:
+                pass
+
         _dataframe_download_button(
             comparative_optimal_df,
             "Comparative_Multi_species_Optimal_Codon_Heatmap.status_matrix.csv",
@@ -5290,12 +6619,18 @@ def _render_comparative_analysis_dashboard(comparative_rscu_df, comparative_opti
             "Download comparative optimal-codon long table CSV",
         )
         st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.warning("Comparative optimal-codon matrix is unavailable. Check whether at least one uploaded GenBank file completed successfully.")
 
-        try:
-            plt.close(fig_opt)
-        except Exception:
-            pass
-
+    # ------------------------------------------------------------------
+    # Data previews
+    # ------------------------------------------------------------------
+    if has_corr:
+        with st.expander("Preview comparative correlation gene-level table", expanded=False):
+            _display_dataframe_one_based(comparative_corr_df, use_container_width=True, height=360)
+    if has_enc_ratio:
+        with st.expander("Preview comparative ENC ratio gene-level table", expanded=False):
+            _display_dataframe_one_based(comparative_enc_ratio_df, use_container_width=True, height=360)
     if has_rscu:
         with st.expander("Preview comparative RSCU matrix", expanded=False):
             _display_dataframe_one_based(comparative_rscu_df, use_container_width=True, height=360)
@@ -5352,12 +6687,14 @@ def _render_batch_mode(settings):
             st.warning("No figure format is selected. Tables, text files, and Excel outputs will still be saved.")
 
         try:
-            log_df, zip_bytes, comparative_rscu_df, comparative_optimal_df = _run_batch_analysis_streamlit(uploaded_files, settings)
+            log_df, zip_bytes, comparative_rscu_df, comparative_optimal_df, comparative_corr_df, comparative_enc_ratio_df = _run_batch_analysis_streamlit(uploaded_files, settings)
             st.session_state["batch_result_log_df"] = log_df
             st.session_state["batch_result_zip_bytes"] = zip_bytes
             st.session_state["batch_result_zip_filename"] = f"ChloroCodon_Batch_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
             st.session_state["batch_comparative_rscu_df"] = comparative_rscu_df
             st.session_state["batch_comparative_optimal_df"] = comparative_optimal_df
+            st.session_state["batch_comparative_corr_df"] = comparative_corr_df
+            st.session_state["batch_comparative_enc_ratio_df"] = comparative_enc_ratio_df
             st.session_state["batch_result_signature"] = current_signature
             st.session_state["batch_result_error"] = None
         except Exception as exc:
@@ -5372,6 +6709,8 @@ def _render_batch_mode(settings):
     zip_bytes = st.session_state.get("batch_result_zip_bytes")
     comparative_rscu_df = st.session_state.get("batch_comparative_rscu_df")
     comparative_optimal_df = st.session_state.get("batch_comparative_optimal_df")
+    comparative_corr_df = st.session_state.get("batch_comparative_corr_df")
+    comparative_enc_ratio_df = st.session_state.get("batch_comparative_enc_ratio_df")
 
     if log_df is None or zip_bytes is None:
         st.info("Files selected. Click **Run batch analysis** to generate the batch package.")
@@ -5394,14 +6733,14 @@ def _render_batch_mode(settings):
         st.markdown("</div>", unsafe_allow_html=True)
 
     elif selected_section == "Comparative plots":
-        _render_comparative_analysis_dashboard(comparative_rscu_df, comparative_optimal_df, settings)
+        _render_comparative_analysis_dashboard(comparative_rscu_df, comparative_optimal_df, comparative_corr_df, comparative_enc_ratio_df, settings)
 
     elif selected_section == "Download package":
         st.markdown(
             """
             <div class="cc-panel">
                 <div class="cc-section-title">Complete batch output package</div>
-                <div class="cc-muted">The ZIP contains per-species result folders, the combined batch workbook, the batch log, and comparative RSCU/optimal-codon outputs when two or more files are successfully analyzed.</div>
+                <div class="cc-muted">The ZIP contains per-species result folders, the combined batch workbook, the batch log, and comparative correlation, ENC-ratio, RSCU, and optimal-codon outputs when files are successfully analyzed.</div>
             </div>
             """,
             unsafe_allow_html=True,
