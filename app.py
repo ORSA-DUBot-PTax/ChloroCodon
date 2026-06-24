@@ -1726,6 +1726,267 @@ def build_summary_text_from_data(data):
     return "\n".join(lines)
 
 
+def _fasta_safe_id(value, fallback="seq"):
+    """Return a compact FASTA-safe identifier."""
+    clean = re.sub(r"[^A-Za-z0-9_.|:-]+", "_", str(value or "").strip())
+    clean = re.sub(r"_+", "_", clean).strip("_")
+    return clean or fallback
+
+
+def _wrap_fasta_sequence(seq, width=70):
+    """Wrap a sequence string for FASTA output."""
+    seq = str(seq or "").strip()
+    return "\n".join(seq[i:i + width] for i in range(0, len(seq), width))
+
+
+def _record_gene_key_for_export(rec, fallback_index=1):
+    """Stable gene key for sequence exports and concatenation."""
+    for key in ("gene", "locus_tag", "protein_id", "label"):
+        value = str(rec.get(key, "") or "").strip()
+        if value:
+            return value
+    return f"CDS_{fallback_index}"
+
+
+def _filtered_cds_fasta_header(rec, index=1, include_length=True):
+    """Build a FASTA header that remains readable but parser-safe."""
+    label = _record_gene_key_for_export(rec, fallback_index=index)
+    fasta_id = _fasta_safe_id(label, fallback=f"CDS_{index}")
+    gene = _fasta_safe_id(rec.get("gene", ""), fallback="NA")
+    locus_tag = _fasta_safe_id(rec.get("locus_tag", ""), fallback="NA")
+    protein_id = _fasta_safe_id(rec.get("protein_id", ""), fallback="NA")
+    organism = str(rec.get("organism", "") or "").strip().replace(" ", "_")
+    organism = _fasta_safe_id(organism, fallback="Unknown_organism")
+    stop = rec.get("terminal_stop_codon", "") or "none"
+    location = str(rec.get("location", "") or "").replace(" ", "")
+    length_part = f"|length_codons={rec.get('length_codons', '')}" if include_length else ""
+    return (
+        f"{fasta_id}|gene={gene}|locus_tag={locus_tag}|protein_id={protein_id}"
+        f"|organism={organism}|stop={stop}{length_part}|location={location}"
+    )
+
+
+def translate_cds_sequence(seq, table_id=11):
+    """Translate a filtered CDS nucleotide sequence using the selected NCBI table."""
+    try:
+        table = get_codon_table(table_id)
+    except Exception:
+        table = get_codon_table(11)
+    seq = str(seq or "").upper().replace("U", "T")
+    aas = []
+    for i in range(0, len(seq) - 2, 3):
+        codon = seq[i:i + 3]
+        if codon in table.stop_codons:
+            aas.append("*")
+        else:
+            aas.append(table.forward_table.get(codon, "X"))
+    return "".join(aas)
+
+
+def build_accepted_cds_metadata_table(records):
+    """Build metadata table for accepted, duplicate-filtered CDS records."""
+    rows = []
+    for idx, rec in enumerate(records or [], start=1):
+        seq_no_stop = rec.get("sequence", "") or ""
+        seq_with_stop = rec.get("sequence_with_stop", seq_no_stop) or seq_no_stop
+        rows.append({
+            "Order": idx,
+            "FASTA_ID": _fasta_safe_id(_record_gene_key_for_export(rec, idx), fallback=f"CDS_{idx}"),
+            "label": rec.get("label", ""),
+            "gene": rec.get("gene", ""),
+            "locus_tag": rec.get("locus_tag", ""),
+            "protein_id": rec.get("protein_id", ""),
+            "product": rec.get("product", ""),
+            "organism": rec.get("organism", ""),
+            "record_id": rec.get("record_id", ""),
+            "feature_index": rec.get("feature_index", ""),
+            "location": rec.get("location", ""),
+            "strand": rec.get("strand", ""),
+            "transl_table": rec.get("transl_table", ""),
+            "filter_mode": rec.get("filter_mode", ""),
+            "terminal_stop_codon": rec.get("terminal_stop_codon", ""),
+            "length_codons_nonstop": rec.get("length_codons", ""),
+            "nucleotide_length_nonstop": len(seq_no_stop),
+            "nucleotide_length_with_stop": len(seq_with_stop),
+        })
+    return pd.DataFrame(rows)
+
+
+def _write_fasta_records(records, output_path):
+    """Write a list of (header, sequence) records to FASTA."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as handle:
+        for header, seq in records:
+            handle.write(f">{header}\n")
+            handle.write(_wrap_fasta_sequence(seq))
+            handle.write("\n")
+
+
+def build_filtered_cds_sequence_export_records(records, table_id=11, prefix_label="ChloroCodon"):
+    """Prepare nucleotide/protein/concatenated FASTA records from accepted CDSs."""
+    nucleotide_no_stop = []
+    nucleotide_with_stop = []
+    protein_records = []
+
+    concat_no_stop_parts = []
+    concat_with_stop_parts = []
+
+    for idx, rec in enumerate(records or [], start=1):
+        transl_table = rec.get("transl_table", table_id)
+        try:
+            transl_table = int(transl_table)
+        except Exception:
+            transl_table = int(table_id)
+
+        seq_no_stop = str(rec.get("sequence", "") or "").upper()
+        seq_with_stop = str(rec.get("sequence_with_stop", seq_no_stop) or seq_no_stop).upper()
+
+        if not seq_no_stop:
+            continue
+
+        header = _filtered_cds_fasta_header(rec, index=idx)
+        nucleotide_no_stop.append((header, seq_no_stop))
+        nucleotide_with_stop.append((header, seq_with_stop))
+        protein_records.append((header, translate_cds_sequence(seq_no_stop, table_id=transl_table)))
+
+        concat_no_stop_parts.append(seq_no_stop)
+        concat_with_stop_parts.append(seq_with_stop)
+
+    safe_prefix = _fasta_safe_id(prefix_label, fallback="ChloroCodon")
+    concatenated_no_stop = []
+    concatenated_with_stop = []
+    if concat_no_stop_parts:
+        concatenated_no_stop.append((f"{safe_prefix}|accepted_CDS_concatenated_nonstop|n_genes={len(concat_no_stop_parts)}", "".join(concat_no_stop_parts)))
+        concatenated_with_stop.append((f"{safe_prefix}|accepted_CDS_concatenated_with_terminal_stops|n_genes={len(concat_with_stop_parts)}", "".join(concat_with_stop_parts)))
+
+    return {
+        "nucleotide_no_stop": nucleotide_no_stop,
+        "nucleotide_with_stop": nucleotide_with_stop,
+        "protein": protein_records,
+        "concatenated_no_stop": concatenated_no_stop,
+        "concatenated_with_stop": concatenated_with_stop,
+    }
+
+
+def save_filtered_cds_sequence_exports(data, output_dir, prefix_name):
+    """Save accepted filtered CDS sequences as FASTA files for downstream analysis."""
+    records = data.get("records", []) if data else []
+    if not records:
+        return {}
+
+    out_dir = Path(output_dir) / "Filtered_CDS_sequences"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe_prefix = sanitize_filename(prefix_name, fallback="ChloroCodon")
+    table_id = 11
+    try:
+        first = records[0]
+        table_id = int(first.get("transl_table", 11))
+    except Exception:
+        table_id = 11
+
+    metadata_df = build_accepted_cds_metadata_table(records)
+    metadata_path = out_dir / f"{safe_prefix}.accepted_filtered_CDS_metadata.csv"
+    metadata_df.to_csv(metadata_path, index=False)
+
+    export_records = build_filtered_cds_sequence_export_records(records, table_id=table_id, prefix_label=safe_prefix)
+
+    paths = {"metadata": metadata_path}
+    file_map = {
+        "nucleotide_no_stop": f"{safe_prefix}.accepted_filtered_CDS_nucleotide_nonstop.fasta",
+        "nucleotide_with_stop": f"{safe_prefix}.accepted_filtered_CDS_nucleotide_with_terminal_stop.fasta",
+        "protein": f"{safe_prefix}.accepted_filtered_CDS_protein.fasta",
+        "concatenated_no_stop": f"{safe_prefix}.accepted_filtered_CDS_concatenated_nonstop.fasta",
+        "concatenated_with_stop": f"{safe_prefix}.accepted_filtered_CDS_concatenated_with_terminal_stops.fasta",
+    }
+
+    for key, filename in file_map.items():
+        path = out_dir / filename
+        _write_fasta_records(export_records.get(key, []), path)
+        paths[key] = path
+
+    readme = out_dir / f"{safe_prefix}.accepted_filtered_CDS_README.txt"
+    with open(readme, "w", encoding="utf-8") as handle:
+        handle.write(
+            "Accepted filtered CDS sequence exports generated by ChloroCodon.\n\n"
+            "Files:\n"
+            "- accepted_filtered_CDS_nucleotide_nonstop.fasta: one FASTA record per accepted CDS after terminal stop removal.\n"
+            "- accepted_filtered_CDS_nucleotide_with_terminal_stop.fasta: one FASTA record per accepted CDS, retaining the annotated terminal stop codon when present.\n"
+            "- accepted_filtered_CDS_protein.fasta: translated amino-acid sequences from the non-stop CDS nucleotide sequences.\n"
+            "- accepted_filtered_CDS_concatenated_nonstop.fasta: one concatenated nucleotide sequence built from all accepted non-stop CDSs in accepted-record order.\n"
+            "- accepted_filtered_CDS_concatenated_with_terminal_stops.fasta: concatenated nucleotide sequence retaining terminal stop codons when present.\n"
+            "- accepted_filtered_CDS_metadata.csv: gene labels, locations, lengths, stop-codon status, and identifiers for the exported CDSs.\n\n"
+            "For phylogenetic concatenation, inspect gene order and orthology before final alignment/tree construction.\n"
+        )
+    paths["readme"] = readme
+    return paths
+
+
+def save_batch_filtered_cds_sequence_exports(batch_success_items, output_dir):
+    """Save batch-level multi-FASTA files containing one concatenated CDS record per successful genome/file."""
+    if not batch_success_items:
+        return {}
+
+    out_dir = Path(output_dir) / "Filtered_CDS_sequences"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    concat_no_stop = []
+    concat_with_stop = []
+    summary_rows = []
+
+    for idx, item in enumerate(batch_success_items, start=1):
+        data = item.get("data", {}) if isinstance(item, dict) else {}
+        records = data.get("records", []) if isinstance(data, dict) else []
+        file_name = str(item.get("file_name", "") or f"Genome_{idx}")
+        species = _infer_species_name_from_batch_item(item, fallback_prefix=Path(file_name).stem or f"Genome_{idx}") if "_infer_species_name_from_batch_item" in globals() else Path(file_name).stem
+        safe_id = _fasta_safe_id(species or Path(file_name).stem, fallback=f"Genome_{idx}")
+
+        parts_no_stop = [str(rec.get("sequence", "") or "").upper() for rec in records if rec.get("sequence")]
+        parts_with_stop = [str(rec.get("sequence_with_stop", rec.get("sequence", "")) or "").upper() for rec in records if rec.get("sequence")]
+        seq_no_stop = "".join(parts_no_stop)
+        seq_with_stop = "".join(parts_with_stop)
+
+        if seq_no_stop:
+            header_base = f"{safe_id}|file={_fasta_safe_id(file_name, fallback=f'Genome_{idx}')}|n_genes={len(parts_no_stop)}"
+            concat_no_stop.append((f"{header_base}|accepted_CDS_concatenated_nonstop", seq_no_stop))
+            concat_with_stop.append((f"{header_base}|accepted_CDS_concatenated_with_terminal_stops", seq_with_stop))
+
+        summary_rows.append({
+            "Order": idx,
+            "File": file_name,
+            "Species": species,
+            "FASTA_ID": safe_id,
+            "Accepted_CDS_count": len(records),
+            "Concatenated_length_nonstop_bp": len(seq_no_stop),
+            "Concatenated_length_with_terminal_stops_bp": len(seq_with_stop),
+        })
+
+    paths = {}
+    no_stop_path = out_dir / "Batch.accepted_filtered_CDS_concatenated_nonstop.multi_fasta"
+    with_stop_path = out_dir / "Batch.accepted_filtered_CDS_concatenated_with_terminal_stops.multi_fasta"
+    summary_path = out_dir / "Batch.accepted_filtered_CDS_concatenation_summary.csv"
+
+    _write_fasta_records(concat_no_stop, no_stop_path)
+    _write_fasta_records(concat_with_stop, with_stop_path)
+    pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
+
+    readme = out_dir / "Batch.accepted_filtered_CDS_sequence_exports_README.txt"
+    with open(readme, "w", encoding="utf-8") as handle:
+        handle.write(
+            "Batch-level accepted filtered CDS exports generated by ChloroCodon.\n\n"
+            "Files:\n"
+            "- Batch.accepted_filtered_CDS_concatenated_nonstop.multi_fasta: one concatenated accepted-CDS nucleotide record per successful input file/genome.\n"
+            "- Batch.accepted_filtered_CDS_concatenated_with_terminal_stops.multi_fasta: same as above, retaining terminal stop codons when present.\n"
+            "- Batch.accepted_filtered_CDS_concatenation_summary.csv: file/species names, accepted CDS counts, and concatenated lengths.\n\n"
+            "These files are intended as convenient starting material for downstream phylogeny workflows. "
+            "Before final tree construction, users should verify orthology, gene presence/absence, gene order, and alignment quality.\n"
+        )
+
+    paths.update({"concat_no_stop": no_stop_path, "concat_with_stop": with_stop_path, "summary": summary_path, "readme": readme})
+    return paths
+
+
+
 def build_output_tables_from_data(data):
     """Create all tabular outputs in one place for CSV and Excel export."""
     tables = {}
@@ -1763,6 +2024,10 @@ def build_output_tables_from_data(data):
             "AT_bias": m["AT_bias"], "GC_bias": m["GC_bias"],
             "CAI": m.get("CAI", np.nan), "CBI": m.get("CBI", np.nan), "FOP": m.get("FOP", np.nan),
         } for m in metrics_list])
+
+    records = data.get("records", []) if data else []
+    if records:
+        tables["accepted_filtered_cds_metadata"] = build_accepted_cds_metadata_table(records)
 
     qc = data.get("qc_df")
     if qc is not None:
@@ -4424,6 +4689,8 @@ def save_analysis_package(data, output_dir, prefix_name, formats, fig_width=8.0,
         with open(prefix.with_suffix(".methods.txt"), "w", encoding="utf-8") as f:
             f.write(str(methods_text))
 
+    save_filtered_cds_sequence_exports(data, prefix.parent, prefix.name)
+
     formats = list(formats or [])
     if save_figures and formats:
         figures = create_batch_figures(data, fig_width, fig_height, label_top=label_top,
@@ -5825,6 +6092,8 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
                 settings,
                 prefix="Comparative_ENC_Ratio_Frequency_Distribution",
             )
+
+        save_batch_filtered_cds_sequence_exports(batch_success_items, batch_root)
 
         workbook_tables = {"Batch_Run_Log": log_df}
         if comparative_rscu_df is not None and not comparative_rscu_df.empty:
