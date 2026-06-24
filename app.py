@@ -212,6 +212,13 @@ DNA_BASES = set("ACGT")
 AA_TO_CODONS = None
 STOP_CODONS = set()
 
+CDS_FILTER_MODES = {
+    "standard": "Standard ChloroCodon mode",
+    "strict_publication": "Strict publication mode",
+}
+STRICT_PUBLICATION_START_CODON = "ATG"
+STRICT_PUBLICATION_STOP_CODONS = {"TAA", "TAG", "TGA"}
+
 
 def get_codon_table(table_id=11):
     """Return an NCBI unambiguous DNA codon table."""
@@ -232,10 +239,28 @@ def init_codon_maps(table_id=11):
     STOP_CODONS = set(table.stop_codons)
 
 
-def parse_genbank(file_path, min_codons=30, table_id=11, trim_partial_tail=True):
-    """Parse GenBank file, extract and filter CDS features."""
+def parse_genbank(file_path, min_codons=30, table_id=11, trim_partial_tail=True, filter_mode="standard"):
+    """Parse GenBank file, extract and filter CDS features.
+
+    Filtering modes
+    ---------------
+    standard
+        Flexible ChloroCodon mode. Pseudogenes, ambiguous bases, internal
+        stops, and CDS shorter than the selected codon threshold are excluded.
+        A terminal stop codon is removed when present, but a terminal stop is
+        not required. Partial non-triplet tails can be trimmed.
+
+    strict_publication
+        Manuscript-style mode. CDS must begin with ATG, end with TAA/TAG/TGA,
+        contain only A/C/G/T, contain no internal stop codons, and satisfy the
+        selected minimum codon length. Non-triplet CDS lengths are rejected.
+    """
     records = []
     qc_rows = []
+    filter_mode = str(filter_mode or "standard")
+    if filter_mode not in CDS_FILTER_MODES:
+        filter_mode = "standard"
+    strict_publication = filter_mode == "strict_publication"
 
     def qualifier_first(q, key, default=""):
         values = q.get(key)
@@ -292,6 +317,9 @@ def parse_genbank(file_path, min_codons=30, table_id=11, trim_partial_tail=True)
 
                 remainder = len(seq) % 3
                 if remainder:
+                    if strict_publication:
+                        qc_rows.append({"label": label, "status": "skipped", "reason": "strict mode: length not divisible by 3"})
+                        continue
                     if trim_partial_tail:
                         seq = seq[:len(seq) - remainder]
                     else:
@@ -305,6 +333,15 @@ def parse_genbank(file_path, min_codons=30, table_id=11, trim_partial_tail=True)
                     continue
 
                 codons_all = [seq[i:i+3] for i in range(0, len(seq), 3)]
+
+                if strict_publication:
+                    if not codons_all or codons_all[0] != STRICT_PUBLICATION_START_CODON:
+                        qc_rows.append({"label": label, "status": "skipped", "reason": "strict mode: start codon is not ATG"})
+                        continue
+                    strict_stop_codons = STRICT_PUBLICATION_STOP_CODONS.intersection(set(table.stop_codons)) or STRICT_PUBLICATION_STOP_CODONS
+                    if not codons_all or codons_all[-1] not in strict_stop_codons:
+                        qc_rows.append({"label": label, "status": "skipped", "reason": "strict mode: missing terminal TAA/TAG/TGA stop codon"})
+                        continue
 
                 # Keep a copy with the terminal stop codon for the RSCU table.
                 # For ENC, PR2, neutrality, COA, and genome statistics, terminal
@@ -342,6 +379,7 @@ def parse_genbank(file_path, min_codons=30, table_id=11, trim_partial_tail=True)
                     "location": str(feature.location),
                     "strand": "+" if feature.location.strand == 1 else "-" if feature.location.strand == -1 else "",
                     "transl_table": transl_table,
+                    "filter_mode": filter_mode,
                     "sequence": seq,
                     "sequence_with_stop": sequence_with_stop,
                     "terminal_stop_codon": terminal_stop_codon,
@@ -1157,18 +1195,42 @@ def build_composition_boxplot_table(metrics_list):
         rows.append(row)
     return pd.DataFrame(rows, columns=["label", "gene", "organism"] + COMPOSITION_BOXPLOT_PARAMETERS)
 
-def generate_methods_text(data, min_codons=30, file_path=""):
+def generate_methods_text(data, min_codons=30, file_path="", filter_mode="standard"):
     """Generate reusable methods text for paper/thesis reporting."""
     stats = data.get("genome_stats", {}) if data else {}
     n_genes = stats.get("Num_genes", "")
     qc_df = data.get("qc_df") if data else None
     accepted = int((qc_df["status"] == "accepted").sum()) if qc_df is not None and not qc_df.empty else ""
     skipped = int(len(qc_df) - accepted) if isinstance(accepted, int) and qc_df is not None else ""
+    filter_mode = str(filter_mode or "standard")
+    filter_label = CDS_FILTER_MODES.get(filter_mode, CDS_FILTER_MODES["standard"])
+
+    if filter_mode == "strict_publication":
+        filtering_text = (
+            f"Coding sequences were extracted from GenBank CDS features using strict publication mode. "
+            f"Pseudogene/pseudo features were excluded. CDSs were retained only when they began with ATG, "
+            f"ended with a valid terminal stop codon (TAA, TAG, or TGA), contained only unambiguous A/C/G/T bases, "
+            f"had a length divisible by three, contained no internal stop codons after terminal-stop removal, "
+            f"and contained at least {min_codons} non-stop codons. Terminal stop codons were retained only for "
+            f"stop-codon/RSCU reporting and excluded from ENC, PR2, neutrality, COA, and coding-composition statistics. "
+            f"Duplicate gene copies were collapsed by retaining the longest CDS copy."
+        )
+    else:
+        filtering_text = (
+            f"Coding sequences were extracted from GenBank CDS features using standard ChloroCodon mode. "
+            f"Pseudogene/pseudo features, ambiguous CDS sequences, CDS with internal stop codons, and CDS shorter than "
+            f"{min_codons} codons were excluded. Terminal stop codons were retained only for stop-codon/RSCU reporting "
+            f"and excluded from ENC, PR2, neutrality, COA, and coding-composition statistics. CDS features without a terminal "
+            f"stop codon were allowed if they passed the other quality-control checks. Duplicate gene copies were collapsed "
+            f"by retaining the longest CDS copy."
+        )
+
     return f"""ChloroCodon analysis methods
 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 Input file: {Path(file_path).name if file_path else ''}
+CDS filtering mode: {filter_label}
 
-Coding sequences were extracted from GenBank CDS features. Pseudogene/pseudo features, ambiguous CDS sequences, CDS with internal stop codons, and CDS shorter than {min_codons} codons were excluded. Terminal stop codons were retained only for stop-codon/RSCU reporting and excluded from ENC, PR2, neutrality, COA, and coding-composition statistics. Duplicate gene copies were collapsed by retaining the longest CDS copy.
+{filtering_text}
 
 Accepted CDS before duplicate removal: {accepted}
 Skipped CDS: {skipped}
@@ -1477,14 +1539,23 @@ def unique_folder(parent_dir, base_name):
     return candidate
 
 
-def analyze_genbank_file(file_path, min_codons=30, table_id=11):
+def analyze_genbank_file(file_path, min_codons=30, table_id=11, filter_mode="standard"):
     """Analyze one GenBank file and return the complete ChloroCodon data dictionary."""
     # Reinitialize codon maps for the selected NCBI table on every analysis run.
     # Without this, changing the genetic-code table in the sidebar could leave
     # the global synonymous-codon families from a previous run.
     table_id = int(table_id)
     init_codon_maps(table_id)
-    records, qc_df, duplicate_df = parse_genbank(file_path, min_codons=int(min_codons), table_id=table_id)
+    filter_mode = str(filter_mode or "standard")
+    if filter_mode not in CDS_FILTER_MODES:
+        filter_mode = "standard"
+    records, qc_df, duplicate_df = parse_genbank(
+        file_path,
+        min_codons=int(min_codons),
+        table_id=table_id,
+        filter_mode=filter_mode,
+        trim_partial_tail=(filter_mode != "strict_publication"),
+    )
     if not records:
         raise ValueError("No valid CDS found after filtering.")
 
@@ -1577,7 +1648,14 @@ def analyze_genbank_file(file_path, min_codons=30, table_id=11):
         "composition_boxplot_df": composition_boxplot_df,
         "qc_df": qc_df,
         "duplicate_df": duplicate_df,
-        "methods_text": generate_methods_text({"genome_stats": genome_stats, "qc_df": qc_df}, min_codons=int(min_codons), file_path=file_path),
+        "filter_mode": filter_mode,
+        "filter_mode_label": CDS_FILTER_MODES.get(filter_mode, CDS_FILTER_MODES["standard"]),
+        "methods_text": generate_methods_text(
+            {"genome_stats": genome_stats, "qc_df": qc_df},
+            min_codons=int(min_codons),
+            file_path=file_path,
+            filter_mode=filter_mode,
+        ),
         "opt_codons": opt_codons,
         "hf_codons": hf_codons,
         "high_expression_codons": high_expression_codons,
@@ -5566,7 +5644,12 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
                 rscu_stack_cmap = settings["rscu_stack_cmap_name"]
 
             try:
-                data = analyze_genbank_file(file_path, min_codons=settings["min_codons"], table_id=settings["table_id"])
+                data = analyze_genbank_file(
+                    file_path,
+                    min_codons=settings["min_codons"],
+                    table_id=settings["table_id"],
+                    filter_mode=settings.get("cds_filter_mode", "standard"),
+                )
                 folder = unique_folder(batch_root, Path(file_name).stem)
                 prefix = folder.name
                 tables = save_analysis_package(
@@ -5604,6 +5687,8 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
                     "Input_path": file_name,
                     "Status": "Done",
                     "Genes": genes,
+                    "CDS_filter_mode": CDS_FILTER_MODES.get(settings.get("cds_filter_mode", "standard"), settings.get("cds_filter_mode", "standard")),
+                    "Minimum_CDS_length_codons": settings["min_codons"],
                     "Plot_theme": theme,
                     "Heatmap_cmap": cmap,
                     "ENC_cmap": enc_cmap,
@@ -5626,6 +5711,8 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
                     "File": file_name,
                     "Input_path": file_name,
                     "Output_folder": str(folder.relative_to(batch_root)),
+                    "CDS_filter_mode": CDS_FILTER_MODES.get(settings.get("cds_filter_mode", "standard"), settings.get("cds_filter_mode", "standard")),
+                    "Minimum_CDS_length_codons": settings["min_codons"],
                     "Plot_theme": theme,
                     "Heatmap_cmap": cmap,
                     "ENC_cmap": enc_cmap,
@@ -5668,6 +5755,8 @@ def _run_batch_analysis_streamlit(uploaded_files, settings):
                     "Input_path": file_name,
                     "Status": "Failed",
                     "Genes": "",
+                    "CDS_filter_mode": CDS_FILTER_MODES.get(settings.get("cds_filter_mode", "standard"), settings.get("cds_filter_mode", "standard")),
+                    "Minimum_CDS_length_codons": settings["min_codons"],
                     "Plot_theme": theme,
                     "Heatmap_cmap": cmap,
                     "ENC_cmap": enc_cmap,
@@ -5785,7 +5874,27 @@ def _sidebar_settings():
     )
 
     with st.sidebar.expander("Analysis settings", expanded=True):
-        min_codons = st.number_input("Minimum CDS length (codons)", min_value=1, max_value=10000, value=30, step=1)
+        cds_filter_mode = st.selectbox(
+            "CDS filtering mode",
+            ["standard", "strict_publication"],
+            index=0,
+            format_func=lambda x: CDS_FILTER_MODES.get(x, x),
+            help=(
+                "Standard mode is flexible for general GenBank analysis. "
+                "Strict publication mode requires ATG start, TAA/TAG/TGA terminal stop, "
+                "unambiguous bases, no internal stop codons, and the selected minimum CDS length."
+            ),
+        )
+        default_min_codons = 300 if cds_filter_mode == "strict_publication" else 30
+        min_codons = st.number_input(
+            "Minimum CDS length (codons)",
+            min_value=1,
+            max_value=10000,
+            value=default_min_codons,
+            step=1,
+            key=f"min_codons_{cds_filter_mode}",
+            help="Strict publication mode commonly uses 300 codons/amino acids by default; you can change it if your study requires another threshold.",
+        )
         table_id = st.number_input("NCBI genetic code table", min_value=1, max_value=33, value=11, step=1)
 
     with st.sidebar.expander("Figure size & labels", expanded=True):
@@ -6047,6 +6156,7 @@ def _sidebar_settings():
         auto_cycle_batch_styles = st.checkbox("Batch mode: auto-cycle themes/colormaps", value=True)
 
     return {
+        "cds_filter_mode": cds_filter_mode,
         "min_codons": int(min_codons),
         "table_id": int(table_id),
         "fig_width": float(fig_width),
@@ -6107,7 +6217,8 @@ def _uploaded_files_signature(uploaded_files):
 
 def _analysis_settings_signature(settings):
     """Signature for settings that affect the biological analysis output."""
-    return f"min_codons={int(settings.get('min_codons', 30))}|table_id={int(settings.get('table_id', 11))}"
+    filter_mode = str(settings.get("cds_filter_mode", "standard"))
+    return f"filter_mode={filter_mode}|min_codons={int(settings.get('min_codons', 30))}|table_id={int(settings.get('table_id', 11))}"
 
 
 def _single_result_signature(uploaded_file, settings):
@@ -6136,6 +6247,9 @@ def _batch_result_signature(uploaded_files, settings):
 def _export_settings_signature(settings):
     """Signature for settings that affect exported figures/packages."""
     export_keys = [
+        "cds_filter_mode",
+        "min_codons",
+        "table_id",
         "fig_width",
         "fig_height",
         "label_top",
@@ -6257,7 +6371,7 @@ def _render_single_mode(settings):
     )
 
     if analysis_settings_changed:
-        st.info("Analysis settings changed. Re-running the analysis with the updated CDS length/genetic-code table...")
+        st.info("Analysis settings changed. Re-running the analysis with the updated CDS filtering mode, CDS length, or genetic-code table...")
 
     if run or analysis_settings_changed:
         with st.spinner("Running codon usage analysis..."):
@@ -6268,6 +6382,7 @@ def _render_single_mode(settings):
                         file_path,
                         min_codons=settings["min_codons"],
                         table_id=settings["table_id"],
+                        filter_mode=settings.get("cds_filter_mode", "standard"),
                     )
                 tables = build_output_tables_from_data(data)
                 st.session_state["single_result_data"] = data
