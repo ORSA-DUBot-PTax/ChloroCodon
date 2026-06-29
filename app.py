@@ -10,10 +10,10 @@ Features:
 - Genome statistics (A%, T%, G%, C%, GC%, GC1%, GC2%, GC3%, A3s/T3s/C3s/G3s/GC3s, ENC, CAI, CBI, FOP)
 - RSCU analysis (64 codons with their RSCU values and amino acid)
 - Optimal codon analysis (high/low ENC groups, ΔRSCU), Sharp & Li CAI, Wright 1990 CBI
-- ENC‑GC3 plot (with expected curve)
+- ENC‑GC3s plot (with expected curve)
 - PR2 bias plot (A3/(A3+T3) vs G3/(G3+C3))
 - Neutrality plot (GC12 vs GC3 with regression)
-- Correspondence Analysis (COA) of codon usage (PCA approximation)
+- True correspondence analysis (COA) of 59 synonymous codons
 - RSCU heatmap across genes with hierarchical clustering
 - RSCU stacked codon-content plot with codon boxes under each amino acid
 - Correlation matrix heatmap for ENC, GC_all, GC1, GC2, and GC3
@@ -22,7 +22,7 @@ All plots are publication-ready and can be saved in selected formats (PNG, PDF, 
 All raw data are exported as CSV files and one Excel workbook.
 
 Dependencies:
-    pip install streamlit biopython pandas numpy matplotlib scipy scikit-learn openpyxl pillow
+    pip install streamlit biopython pandas numpy matplotlib scipy openpyxl pillow
 """
 
 import threading
@@ -56,8 +56,6 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 from scipy.stats import linregress, pearsonr, gaussian_kde
 from scipy.cluster.hierarchy import linkage, dendrogram
 from scipy.spatial.distance import pdist
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
 from Bio import SeqIO
 from Bio.Data import CodonTable
 
@@ -96,7 +94,7 @@ APP_THEME = {
 DEVELOPER_FOOTER = """
 <div class="cc-footer-inner">
     <div class="cc-footer-brand">ChloroCodon</div>
-    <div class="cc-footer-meta">GenBank parsing · Codon-bias analytics · Streamlit UI · Pandas/NumPy tables · Matplotlib figures · SciPy regression/clustering · scikit-learn PCA · Excel/ZIP exports</div>
+    <div class="cc-footer-meta">GenBank parsing · Codon-bias analytics · Streamlit UI · Pandas/NumPy tables · Matplotlib figures · SciPy regression/clustering · NumPy/SciPy COA · Excel/ZIP exports</div>
     <div class="cc-footer-copy">© 2026 · Developed by Sheikh Sunzid Ahmed and M. Oliur Rahman</div>
     <div class="cc-footer-lab">Plant Taxonomy and Ethnobotany Laboratory, Department of Botany, University of Dhaka</div>
 </div>
@@ -479,15 +477,145 @@ def effective_number_of_codons(codon_counts, table_id=11):
     return min(max(enc, 20.0), 61.0)
 
 
-def expected_enc(gc3):
-    """Expected ENC under the GC3-only model."""
-    if pd.isna(gc3):
+def _composition_to_fraction(value):
+    """Return a nucleotide-composition value as a fraction in the 0-1 range."""
+    try:
+        if pd.isna(value):
+            return np.nan
+        value = float(value)
+    except Exception:
         return np.nan
-    s = float(gc3)
+    return value / 100.0 if abs(value) > 1.0 else value
+
+
+def expected_enc(gc3s):
+    """Expected ENC under Wright's GC3s-only model.
+
+    The literature-standard ENC curve uses S = GC3s, the G+C fraction at
+    synonymous third codon positions. The input may be either a fraction
+    (0-1) or a percentage (0-100).
+    """
+    s = _composition_to_fraction(gc3s)
+    if pd.isna(s):
+        return np.nan
     denom = s**2 + (1.0 - s)**2
     if denom == 0:
         return np.nan
     return 2.0 + s + 29.0 / denom
+
+
+def rfsc_from_counts(codon_counts, table_id=11):
+    """Compute RFSC within synonymous codon families for all displayed codons.
+
+    RFSC_ij = X_ij / sum_j(X_ij) within the amino-acid synonymous family.
+    Stop codons are handled as their own terminal-codon family for reporting.
+    """
+    global AA_TO_CODONS, STOP_CODONS
+    if AA_TO_CODONS is None or not STOP_CODONS:
+        init_codon_maps(table_id)
+
+    rfsc = {c: 0.0 for c in CODON_ORDER}
+    for aa, codons in AA_TO_CODONS.items():
+        total = float(sum(codon_counts.get(c, 0) for c in codons))
+        for c in codons:
+            rfsc[c] = float(codon_counts.get(c, 0)) / total if total else 0.0
+
+    stop_codons = [c for c in CODON_ORDER if c in STOP_CODONS]
+    total_stop = float(sum(codon_counts.get(c, 0) for c in stop_codons))
+    for c in stop_codons:
+        rfsc[c] = float(codon_counts.get(c, 0)) / total_stop if total_stop else 0.0
+
+    return rfsc
+
+
+def synonymous_codons_for_coa(table_id=11):
+    """Return codons used for true COA: synonymous sense codons only.
+
+    Single-codon amino acids such as Met and Trp and stop codons are
+    excluded, giving 59 codons for the standard genetic code.
+    """
+    global AA_TO_CODONS, STOP_CODONS
+    if AA_TO_CODONS is None or not STOP_CODONS:
+        init_codon_maps(table_id)
+    codons = []
+    for aa in sorted(AA_TO_CODONS.keys()):
+        family = [c for c in AA_TO_CODONS[aa] if c not in STOP_CODONS]
+        if len(family) <= 1:
+            continue
+        codons.extend(family)
+    # Keep the standard codon table order for readable exports and plots.
+    return [c for c in CODON_ORDER if c in set(codons)]
+
+
+def true_correspondence_analysis(matrix, row_labels=None, column_labels=None, n_components=2):
+    """Perform correspondence analysis on a non-negative row × column matrix.
+
+    Returns row principal coordinates, column principal coordinates, and the
+    percentage inertia explained by each retained axis. Rows/columns with zero
+    mass are removed before singular-value decomposition.
+    """
+    X = np.asarray(matrix, dtype=float)
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    X[X < 0] = 0.0
+
+    row_labels = list(row_labels or [f"Row_{i+1}" for i in range(X.shape[0])])
+    column_labels = list(column_labels or [f"Col_{j+1}" for j in range(X.shape[1])])
+
+    if X.ndim != 2 or X.shape[0] < 2 or X.shape[1] < 2 or X.sum() <= 0:
+        empty_rows = pd.DataFrame(columns=["Axis1", "Axis2", "label"])
+        empty_cols = pd.DataFrame(columns=["Axis1", "Axis2", "codon"])
+        return empty_rows, empty_cols, np.array([0.0, 0.0])
+
+    row_mass_raw = X.sum(axis=1)
+    col_mass_raw = X.sum(axis=0)
+    row_mask = row_mass_raw > 0
+    col_mask = col_mass_raw > 0
+    X = X[np.ix_(row_mask, col_mask)]
+    row_labels = [lab for lab, keep in zip(row_labels, row_mask) if keep]
+    column_labels = [lab for lab, keep in zip(column_labels, col_mask) if keep]
+
+    if X.shape[0] < 2 or X.shape[1] < 2 or X.sum() <= 0:
+        empty_rows = pd.DataFrame(columns=["Axis1", "Axis2", "label"])
+        empty_cols = pd.DataFrame(columns=["Axis1", "Axis2", "codon"])
+        return empty_rows, empty_cols, np.array([0.0, 0.0])
+
+    P = X / X.sum()
+    r = P.sum(axis=1)
+    c = P.sum(axis=0)
+    expected = np.outer(r, c)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        S = (P - expected) / np.sqrt(expected)
+    S = np.nan_to_num(S, nan=0.0, posinf=0.0, neginf=0.0)
+
+    U, singular_values, Vt = np.linalg.svd(S, full_matrices=False)
+    max_components = min(n_components, len(singular_values))
+    if max_components == 0:
+        empty_rows = pd.DataFrame(columns=["Axis1", "Axis2", "label"])
+        empty_cols = pd.DataFrame(columns=["Axis1", "Axis2", "codon"])
+        return empty_rows, empty_cols, np.array([0.0, 0.0])
+
+    eigenvalues = singular_values**2
+    total_inertia = float(eigenvalues.sum())
+    explained = eigenvalues[:max_components] / total_inertia * 100.0 if total_inertia > 0 else np.zeros(max_components)
+
+    Dr_inv_sqrt = np.diag(1.0 / np.sqrt(r))
+    Dc_inv_sqrt = np.diag(1.0 / np.sqrt(c))
+    row_coords = Dr_inv_sqrt @ U[:, :max_components] @ np.diag(singular_values[:max_components])
+    col_coords = Dc_inv_sqrt @ Vt.T[:, :max_components] @ np.diag(singular_values[:max_components])
+
+    def pad_coords(coords):
+        if coords.shape[1] >= 2:
+            return coords[:, :2]
+        return np.column_stack([coords[:, 0], np.zeros(coords.shape[0])])
+
+    row_coords = pad_coords(row_coords)
+    col_coords = pad_coords(col_coords)
+    explained = np.pad(explained[:2], (0, max(0, 2 - len(explained))), constant_values=0.0)
+
+    row_df = pd.DataFrame({"Axis1": row_coords[:, 0], "Axis2": row_coords[:, 1], "label": row_labels})
+    col_df = pd.DataFrame({"Axis1": col_coords[:, 0], "Axis2": col_coords[:, 1], "codon": column_labels})
+    return row_df, col_df, explained
 
 
 def rscu_from_counts(codon_counts, table_id=11):
@@ -621,10 +749,10 @@ def compute_per_gene_metrics(rec, table_id=11):
     gc = gc_content(seq)
     gc1, gc2, gc3 = positional_gc(seq)
     gc12 = (gc1 + gc2) / 2 if not np.isnan(gc1) and not np.isnan(gc2) else np.nan
-    enc = effective_number_of_codons(codon_counts, table_id)
-    enc_exp = expected_enc(gc3)
     third = third_position_stats(seq)
     syn3 = synonymous_third_position_stats_from_counts(codon_counts, table_id=table_id)
+    enc = effective_number_of_codons(codon_counts, table_id)
+    enc_exp = expected_enc(syn3.get("GC3s", np.nan))
     rscu, _ = rscu_from_counts(codon_counts_for_rscu, table_id)
     return {
         "label": rec["label"],
@@ -1019,12 +1147,12 @@ def build_rscu_publication_table(records, table_id=11):
     """Build the publication-style RSCU table: Codon, amino acid, count, RFSC, RSCU, preferred."""
     total_counts = aggregate_codon_counts(records, table_id=table_id, include_terminal_stop=True)
     rscu_dict, codon_to_aa = rscu_from_counts(total_counts, table_id=table_id)
-    total_codons = sum(total_counts.values())
+    rfsc_dict = rfsc_from_counts(total_counts, table_id=table_id)
     rows = []
     for codon in CODON_ORDER:
         aa = codon_to_aa.get(codon, "")
         count = int(total_counts.get(codon, 0))
-        rfsc_value = (count / total_codons) if total_codons else 0.0
+        rfsc_value = float(rfsc_dict.get(codon, 0.0))
         rscu_value = float(rscu_dict.get(codon, 0.0))
         preferred = "Yes" if aa != "*" and rscu_value > 1.0 else "No"
         rows.append({
@@ -1236,7 +1364,7 @@ Accepted CDS before duplicate removal: {accepted}
 Skipped CDS: {skipped}
 CDS used after duplicate removal: {n_genes}
 
-RSCU was calculated by normalizing each codon count by the expected count under equal synonymous codon usage within the same amino-acid family. Stop codons were grouped together and displayed with amino-acid symbol '*'. ENC was estimated using Wright's homozygosity approach and plotted against GC3 with the expected ENC curve. PR2 was plotted as A3/(A3+T3) versus G3/(G3+C3). Neutrality analysis was performed by regressing GC12 against GC3. COA was approximated by PCA of standardized codon-frequency profiles. Optimal codons were identified using the published ENC/RSCU intersection method: sense codons with whole-dataset RSCU > 1 were treated as high-frequency codons; the lowest 10% ENC CDSs were used as the high-expression proxy group and the highest 10% ENC CDSs as the low-expression proxy group; ΔRSCU was calculated as RSCU_high_expression - RSCU_low_expression; codons satisfying both RSCU > 1 and ΔRSCU ≥ 0.08 were reported as putative optimal codons. CAI was calculated using the Sharp and Li relative-adaptiveness approach with the low-ENC reference set. CBI was calculated using Wright's codon bias index formula. FOP was calculated as the frequency of detected optimal codons within synonymous families where optimal codons were defined. A gene-by-codon RSCU matrix including all 64 codons was visualized as a heatmap ordered by average-linkage hierarchical clustering; stop codons were labelled with '*', and dendrograms were not displayed to improve readability. A publication-style stacked RSCU codon-content plot was generated by grouping sense codons under their corresponding amino acids and drawing codon-labelled colour boxes beneath the amino-acid axis. A CDS nucleotide-composition and positional-GC distribution boxplot was generated from per-CDS T3s, C3s, A3s, G3s, GC, GC1, GC2, and GC3 fractions. Pearson correlations among ENC, GC_all, GC1, GC2, and GC3 were summarized using a correlation heatmap.
+RSCU was calculated by normalizing each codon count by the expected count under equal synonymous codon usage within the same amino-acid family. RFSC was calculated within each synonymous codon family as the observed count of a codon divided by the total observed count for the corresponding amino acid. Stop codons were grouped together and displayed with amino-acid symbol '*'. ENC was estimated using Wright's homozygosity approach and plotted against GC3s with the expected ENC curve, where S = GC3s. PR2 was plotted as A3/(A3+T3) versus G3/(G3+C3). Neutrality analysis was performed by regressing GC12 against GC3. True correspondence analysis (COA) was performed on the gene-by-codon RSCU matrix for synonymous sense codons, excluding single-codon amino acids and stop codons. Optimal codons were identified using the published ENC/RSCU intersection method: sense codons with whole-dataset RSCU > 1 were treated as high-frequency codons; the lowest 10% ENC CDSs were used as the high-expression proxy group and the highest 10% ENC CDSs as the low-expression proxy group; ΔRSCU was calculated as RSCU_high_expression - RSCU_low_expression; codons satisfying both RSCU > 1 and ΔRSCU ≥ 0.08 were reported as putative optimal codons. CAI was calculated using the Sharp and Li relative-adaptiveness approach with the low-ENC reference set. CBI was calculated using Wright's codon bias index formula. FOP was calculated as the frequency of detected optimal codons within synonymous families where optimal codons were defined. A gene-by-codon RSCU matrix including all 64 codons was visualized as a heatmap ordered by average-linkage hierarchical clustering; stop codons were labelled with '*', and dendrograms were not displayed to improve readability. A publication-style stacked RSCU codon-content plot was generated by grouping sense codons under their corresponding amino acids and drawing codon-labelled colour boxes beneath the amino-acid axis. A CDS nucleotide-composition and positional-GC distribution boxplot was generated from per-CDS T3s, C3s, A3s, G3s, GC, GC1, GC2, and GC3 fractions. Pearson correlations among ENC, GC_all, GC1, GC2, and GC3 were summarized using a correlation heatmap.
 """
 
 
@@ -1587,11 +1715,13 @@ def analyze_genbank_file(file_path, min_codons=30, table_id=11, filter_mode="sta
         m["FOP"] = calculate_fop_from_counts(m["codon_counts"], opt_codons, table_id=table_id)
 
     df_enc = pd.DataFrame([{
+        "GC3s": m.get("GC3s", np.nan),
         "GC3": m["GC3"] * 100 if not np.isnan(m["GC3"]) else np.nan,
         "ENC": m["ENC"] if not np.isnan(m["ENC"]) else np.nan,
+        "ENC_exp": m.get("ENC_exp", np.nan),
         "total_codons": m["total_codons"],
         "label": m["label"],
-    } for m in metrics_list]).dropna()
+    } for m in metrics_list]).dropna(subset=["GC3s", "ENC"])
 
     df_pr2 = pd.DataFrame([{
         "AT_bias": m["AT_bias"],
@@ -1605,33 +1735,28 @@ def analyze_genbank_file(file_path, min_codons=30, table_id=11, filter_mode="sta
         "label": m["label"],
     } for m in metrics_list]).dropna()
 
-    codon_list = CODON_ORDER
+    coa_codon_list = synonymous_codons_for_coa(table_id=table_id)
     X = []
     labels = []
     for m in metrics_list:
-        total = m["total_codons"]
-        if total == 0:
+        rscu_values = m.get("rscu", {})
+        values = [float(rscu_values.get(c, 0.0)) for c in coa_codon_list]
+        if np.nansum(values) <= 0:
             continue
-        counts = [m["codon_counts"].get(c, 0) / total for c in codon_list]
-        X.append(counts)
+        X.append(values)
         labels.append(m["label"])
 
-    if len(X) < 2:
+    if len(X) < 2 or len(coa_codon_list) < 2:
         coa_df = pd.DataFrame({"Axis1": [], "Axis2": [], "label": []})
-        coa_explained = [0, 0]
+        coa_codon_df = pd.DataFrame({"Axis1": [], "Axis2": [], "codon": []})
+        coa_explained = np.array([0.0, 0.0])
     else:
-        X_arr = np.array(X)
-        X_arr = np.nan_to_num(X_arr)
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X_arr)
-        pca = PCA(n_components=2)
-        coords = pca.fit_transform(X_scaled)
-        coa_df = pd.DataFrame({
-            "Axis1": coords[:, 0],
-            "Axis2": coords[:, 1],
-            "label": labels,
-        })
-        coa_explained = pca.explained_variance_ratio_ * 100
+        coa_df, coa_codon_df, coa_explained = true_correspondence_analysis(
+            np.array(X, dtype=float),
+            row_labels=labels,
+            column_labels=coa_codon_list,
+            n_components=2,
+        )
 
     data = {
         "records": records,
@@ -1666,6 +1791,7 @@ def analyze_genbank_file(file_path, min_codons=30, table_id=11, filter_mode="sta
         "df_pr2": df_pr2,
         "df_neutral": df_neutral,
         "coa_df": coa_df,
+        "coa_codon_df": coa_codon_df,
         "coa_explained": coa_explained,
         "input_file": str(file_path),
     }
@@ -2085,7 +2211,11 @@ def build_output_tables_from_data(data):
         tables["neutrality_plot_data"] = df_neutral
     coa_df = data.get("coa_df")
     if coa_df is not None:
-        tables["coa_scores"] = coa_df
+        tables["coa_gene_scores"] = coa_df
+
+    coa_codon_df = data.get("coa_codon_df")
+    if coa_codon_df is not None:
+        tables["coa_codon_scores"] = coa_codon_df
 
     return tables
 
@@ -2170,7 +2300,7 @@ def create_enc_figure(data, width, height, label_top, palette):
         ax.text(0.5, 0.5, "No data available", ha="center", va="center", transform=ax.transAxes, color=palette["text"])
         fig.tight_layout()
         return fig
-    sc = ax.scatter(df["GC3"], df["ENC"], c=df["total_codons"], cmap=palette["cmap"],
+    sc = ax.scatter(df["GC3s"], df["ENC"], c=df["total_codons"], cmap=palette["cmap"],
                     s=VISIBLE_SCATTER_SIZE, edgecolors=VISIBLE_SCATTER_EDGE,
                     linewidth=VISIBLE_SCATTER_LINEWIDTH, alpha=VISIBLE_SCATTER_ALPHA,
                     zorder=VISIBLE_SCATTER_ZORDER)
@@ -2178,15 +2308,15 @@ def create_enc_figure(data, width, height, label_top, palette):
     s = x_curve / 100
     y_curve = 2.0 + s + 29.0 / (s**2 + (1 - s)**2)
     ax.plot(x_curve, y_curve, linestyle="--", color=palette["line"], linewidth=2.0, label="Expected ENC")
-    ax.set_xlabel("GC3 (%)", fontsize=11)
+    ax.set_xlabel("GC3s (%)", fontsize=11)
     ax.set_ylabel("Effective Number of Codons (ENC)", fontsize=11)
-    ax.set_title("ENC-GC3 Plot", fontsize=15, fontweight="bold", pad=12)
+    ax.set_title("ENC-GC3s Plot", fontsize=15, fontweight="bold", pad=12)
     ax.set_xlim(0, 100)
     ax.set_ylim(18, 63)
     enc_label_df = df.copy()
-    s_obs = enc_label_df["GC3"] / 100.0
+    s_obs = enc_label_df["GC3s"] / 100.0
     enc_label_df["deviation"] = (enc_label_df["ENC"] - (2.0 + s_obs + 29.0 / (s_obs**2 + (1 - s_obs)**2))).abs()
-    label_top_points_static(ax, enc_label_df, "GC3", "ENC", label_top=label_top, palette=palette, score_col="deviation")
+    label_top_points_static(ax, enc_label_df, "GC3s", "ENC", label_top=label_top, palette=palette, score_col="deviation")
     style_axes_static(fig, ax, palette)
     ax.legend(loc="upper right", frameon=True)
     cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
@@ -2387,7 +2517,7 @@ def create_neutrality_figure(data, width, height, label_top, palette):
 
 
 def create_coa_figure(data, width, height, label_top, palette):
-    """Create COA/PCA figure with user-selectable theme and point colormap."""
+    """Create true correspondence analysis (COA) figure."""
     df = data.get("coa_df")
     explained = data.get("coa_explained", [0, 0])
     fig, ax = make_batch_figure(width, height, palette)
@@ -2416,7 +2546,7 @@ def create_coa_figure(data, width, height, label_top, palette):
     label_top_points_static(ax, coa_label_df, "Axis1", "Axis2", label_top=label_top, palette=palette, score_col="distance")
     ax.set_xlabel(f"Axis 1 ({explained[0]:.2f}% variance)", fontsize=11)
     ax.set_ylabel(f"Axis 2 ({explained[1]:.2f}% variance)", fontsize=11)
-    ax.set_title("Correspondence Analysis (PCA approximation)", fontsize=15, fontweight="bold", pad=12)
+    ax.set_title("Correspondence Analysis (COA)", fontsize=15, fontweight="bold", pad=12)
     style_axes_static(fig, ax, palette)
     cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label("Distance from origin")
@@ -3338,8 +3468,8 @@ def build_multispecies_enc_ratio_dataset(batch_success_items, table_id=11):
     ENC_ratio = (ENC_exp - ENC_obs) / ENC_exp
 
     ENCobs is the observed ENC per CDS. ENCexp is the expected ENC calculated
-    from GC3 using Wright's expected ENC curve. Positive values mean ENCobs is
-    lower than the GC3-only expectation, suggesting stronger codon-bias
+    from GC3s using Wright's expected ENC curve. Positive values mean ENCobs is
+    lower than the GC3s-only expectation, suggesting stronger codon-bias
     deviation from the mutation-only expectation.
     """
     output_columns = [
@@ -3366,7 +3496,7 @@ def build_multispecies_enc_ratio_dataset(batch_success_items, table_id=11):
             enc_obs = m.get("ENC", np.nan)
             enc_exp = m.get("ENC_exp", m.get("ENC_expected", np.nan))
             if pd.isna(enc_exp):
-                enc_exp = expected_enc(m.get("GC3", np.nan))
+                enc_exp = expected_enc(m.get("GC3s", np.nan))
             try:
                 enc_obs = float(enc_obs)
                 enc_exp = float(enc_exp)
@@ -6185,7 +6315,7 @@ def _sidebar_settings():
             "ENC scatter colormap",
             BATCH_SCATTER_CMAPS,
             index=BATCH_SCATTER_CMAPS.index("viridis"),
-            help="Controls point colouring only in the ENC-GC3 scatter plot.",
+            help="Controls point colouring only in the ENC-GC3s scatter plot.",
         )
 
     with st.sidebar.expander("PR2 scatter styling", expanded=True):
@@ -6272,7 +6402,7 @@ def _sidebar_settings():
             "COA theme",
             theme_options,
             index=theme_options.index("default"),
-            help="Controls the COA plot background, labels, grid, and reference lines.",
+            help="Controls the true COA plot background, labels, grid, and reference lines.",
         )
         coa_cmap_name = st.selectbox(
             "COA point colormap",
